@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Forager</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fredoka:wght@500;600;700&family=Nunito:wght@500;600;700;800&display=swap">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/"
+      }
+    }
+  </script>
+</head>
+<body>
+  <canvas id="view" aria-label="3D view of the ecosystem"></canvas>
+  <div id="bubbles" class="bubbles" aria-hidden="true"></div>
+  <div id="tag" class="tag" hidden></div>
+
+  <header class="topbar panel">
+    <div class="brand">🌿 Forager</div>
+    <div class="clock">
+      <span class="clock-icon" id="clock-icon">☀️</span>
+      <div>
+        <div class="clock-time" id="clock-time">06:00</div>
+        <div class="clock-date" id="clock-date">Day 1</div>
+      </div>
+    </div>
+    <div class="playback">
+      <button id="play" class="round primary" title="Play / pause (Space)">⏸</button>
+      <div class="speeds" id="speeds"></div>
+    </div>
+    <div class="pops" id="pops"></div>
+    <div class="actions">
+      <button id="btn-insights" class="pill" title="Explanations of what is happening, and why">💡 Why? <span class="count" id="insight-count" hidden>0</span></button>
+      <button id="btn-events" class="pill">⚡ Events</button>
+      <button id="btn-repop" class="pill" title="Replace all animals with a new founding population">🐣 Repopulate</button>
+      <button id="btn-world" class="pill">🗺️ New world</button>
+      <button id="btn-data" class="pill accent">📈 Data</button>
+    </div>
+  </header>
+
+  <div class="effects" id="effects"></div>
+  <nav class="toolbar panel" id="toolbar" aria-label="Sandbox tools"></nav>
+  <div class="tool-options panel" id="tool-options" hidden></div>
+  <aside class="inspector panel" id="inspector" hidden></aside>
+  <aside class="insights panel" id="insights" hidden aria-label="Explanations"></aside>
+  <div class="popups" id="popups" aria-live="polite"></div>
+
+  <section class="drawer panel" id="drawer" hidden>
+    <div class="drawer-head">
+      <div class="tabs" id="tabs"></div>
+      <div class="drawer-controls" id="drawer-controls"></div>
+      <div class="spacer"></div>
+      <button id="csv" class="pill small">⬇ CSV</button>
+      <button id="drawer-close" class="round small" aria-label="Close">✕</button>
+    </div>
+    <div class="drawer-body" id="drawer-body"></div>
+  </section>
+
+  <div class="menu panel" id="events-menu" hidden></div>
+  <div class="modal-backdrop" id="world-modal" hidden><form class="modal panel" id="world-form"></form></div>
+  <div class="modal-backdrop" id="summary-modal" hidden><div class="modal panel summary" id="summary" role="dialog" aria-label="Run summary"></div></div>
+  <div class="hint" id="hint"></div>
+  <div class="chart-tip panel" id="chart-tip" hidden></div>
+  <div class="toast" id="toast" hidden></div>
+
+  <script type="module" src="{{ url_for('static', filename='js/main.js') }}"></script>
+</body>
+</html>
