@@ -49,7 +49,12 @@ def step(animal, world, desired: float, distance: float, kappa: float) -> float:
     else:
         heading = desired
     x, y = animal.x, animal.y
-    walkable = world.walkable
+    if distance > 1.0:
+        # A stride longer than a cell must not hop over water or rock on the way.
+        def walkable(px, py):
+            return world.walkable(px, py) and world.clear_path(x, y, px, py)
+    else:
+        walkable = world.walkable
 
     nx, ny = x + math.cos(heading) * distance, y + math.sin(heading) * distance
     if walkable(nx, ny):

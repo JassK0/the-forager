@@ -5,19 +5,24 @@ import bisect
 import math
 import random
 from collections import Counter
+from dataclasses import replace
 
 import numpy as np
 
 from . import brain
-from .animal import ALERT_TICKS, BRAIN_LOG_EVERY, DANGER_MEMORY_DAYS, FIGHT_LOST, FIGHT_WON, FOOD_MEMORY_DAYS, \
-    PAIN_CHASED, REGION, REWARD_MATING, THUMP_RADIUS, Act, Animal, Cache, Carrion
-from .coats import PARTS, PRESETS
-from .config import SimConfig, settings_of
+from .animal import (ALERT_TICKS, BIRTH_MASS, BRAIN_LOG_EVERY, DANGER_MEMORY_DAYS, FIGHT_LOST, FIGHT_WON,
+                     FOOD_MEMORY_DAYS, PAIN_CHASED, REGION, REWARD_MATING, SEARCH_IMAGE_GAIN, THUMP_RADIUS, Act, Animal,
+                     Cache, Carrion)
+from .climate import BIOMES, CLIMATES, Climate
+from .coats import MOULTS, PARTS, PRESETS, WINTER_LUM, WINTER_YB, coat_tone, tone
+from .config import SimConfig, settings_of, supercharge
 from .genetics import GenomeSpec
+from .ledger import Ledger
 from .narrator import OBSERVE, Narrator
 from .navigation import find_path
-from .terrain import GRASS, ROCK, SAND, TREE, TYPE_NAMES, WATER, generate_terrain
-from .vegetation import Vegetation
+from .terrain import FOREST, GRASS, ROCK, SAND, TREE, TYPE_NAMES, WALKABLE as WALKABLE_TYPES, WATER, generate_terrain
+from .rodents import VOLE_ENERGY, Voles
+from .vegetation import Fruit, Vegetation
 
 TAU = 2 * math.pi
 BUCKET_SHIFT = 3  # spatial hash buckets are 8 x 8 cells
@@ -30,11 +35,27 @@ CACHE_DAYS = 4  # buried food lasts this long
 CACHE_DECAY = 0.998  # per tick: cached meat slowly spoils
 CAUSES = ("predation", "starvation", "dehydration", "old age", "disease", "fighting", "emigrated", "removed")
 CONTEST_CHANCE = 0.5  # chance a floater stands its ground against a resident instead of fleeing
+MATE_QUALITY_TYPICAL = 0.75  # mate quality of a typical healthy adult male in good condition
+RIVAL_RADIUS = 4.0  # rival males this close to a female compete for her
+MATING_FORAY = 2.0  # territorial males search this many times their usual mate range in season
+FRUIT_MIN = 5.0  # ripe fruit on a bush worth walking to
 OWNER_ADVANTAGE = 1.3  # residents win more contests than their size alone predicts
 FIGHT_COST = 0.05  # reserves each contestant burns in a fight
 FIGHT_DEATH = (0.005, 0.02)  # chance the loser is fatally injured, outside and during the mating season
 TERRITORY_SCALE = (0.6, 1.6)  # how far food can shrink or stretch the spacing between territories
 SEASONS = ("spring", "summer", "autumn", "winter")
+# Camouflage. The ground's natural colours, seen the way foxes and rabbits see
+# (lightness and yellow-blue; see coats.py): green meadow, dead straw-coloured
+# grass, bare earth, leaf litter in the shade of trees, pale sand, grey rock,
+# snow. An animal is hard to see when its coat matches the ground under it,
+# above all while it keeps still: movement gives it away (Stevens & Merilaita
+# 2009). Lightness contrast matters most for spotting; yellow-blue counts half.
+GROUND = {k: tone(c) for k, c in {
+    "lush": "#55703a", "straw": "#b8a46e", "soil": "#7d6a50", "forest": "#4a3f2f",
+    "sand": "#d8c695", "rock": "#8c8c88", "snow": "#eef2f6"}.items()}
+CHROMA = 0.5  # weight of yellow-blue against lightness contrast
+MOTION_SHOWS = 1.3  # a moving animal is at least this conspicuous, however well it matches
+MOTION_WEIGHT = 0.7  # how much full-speed movement overrides camouflage
 PAINTABLE = {"water": WATER, "grass": GRASS, "sand": SAND, "tree": TREE, "rock": ROCK}
 EVENTS = {
     "drought": "Plant growth almost stops for two days",
@@ -80,12 +101,21 @@ def _smooth(a: float, b: float, x: float) -> float:
 
 class World:
     def __init__(self, cfg: SimConfig, seed: int = 0):
+        if cfg.super_animals:
+            cfg = replace(cfg, species=tuple(supercharge(s, cfg.evolution_speed) for s in cfg.species))
         self.cfg = cfg
+        self.alphas: list[list[int]] = [[] for _ in cfg.species]  # super animals mode: the strongest of each species
         self.seed = seed
         self.rng = random.Random(seed)
         self.nrng = np.random.default_rng(seed)
         self.terrain = generate_terrain(self.nrng, cfg)
-        self.veg = Vegetation(self.terrain, cfg, self.nrng)
+        self.climate = Climate(cfg.climate, self.terrain, seed)
+        self._biomes = None  # biome per cell, worked out when first needed
+        self._tones = None  # each coat's (lightness, yellow-blue), per species
+        self.climate.shape_terrain(self.terrain, np.random.default_rng(seed + 104729))
+        self.veg = Vegetation(self.terrain, cfg, self.nrng, self.climate.productivity)
+        self.fruit = Fruit(self.terrain)
+        self.voles = Voles(self.veg)
         self.width, self.height = cfg.width, cfg.height
         self.plant_energy = cfg.plant_energy
 
@@ -105,6 +135,7 @@ class World:
         self.animals: list[Animal] = []
         self.by_id: dict[int, Animal] = {}
         self.region_cols = (self.width + REGION - 1) // REGION
+        self._thought = [None] * len(cfg.species)  # each species' latest (scores, hidden) batch
         self.brains = self._brain_tables()
         self._born: list[Animal] = []
         self._deaths_pending = False
@@ -127,17 +158,24 @@ class World:
         self.rest_remaining = [0] * n
         self.plague = [0.0] * n
         self._environment()
+        self.ledger = Ledger(self, CAUSES)
 
         self._index_land()
         self._reset_history()
         for si, s in enumerate(self.species):
             for _ in range(s.initial):
                 self._add(self._founder(si, self._land, mature=False))
+        self._rebuild_buckets()
+        self._base_power = [self._mean_power(si) for si in range(n)]
         self._record()
+        self.ledger.counts_changed(self.counts())
+        self.ledger.record()
 
     def _reset_counters(self) -> None:
         n = len(self.species)
         self.births = [0] * n
+        self.arrivals = [0] * n  # immigrants and animals added with the sandbox
+        self.matings = [0] * n
         self.stillborn = [0] * n
         self.rejections = [0] * n
         self.deaths = [Counter() for _ in range(n)]
@@ -191,7 +229,15 @@ class World:
         self.cold = max(0.0, -temp)
         self.heat = max(0.0, temp)
         self.snow = min(1.0, max(0.0, (-temp - 0.35) / 0.4))
+        self.season_temp = temp  # local temperatures add each place's climate (climate.py)
         self.growth = growth
+        # Grass browns as it stops growing in autumn and winter (dead, straw-coloured).
+        self.grass_brown = min(1.0, max(0.0, (1.0 - growth) / 0.5)) if cfg.seasons else 0.0
+        # Moult: animals with the winter-white gene turn white from mid-autumn and
+        # brown again in early spring, cued by day length, not by snow.
+        self.moult = 0.0
+        if cfg.seasons:
+            self.moult = float(_smooth(0.62, 0.78, f) if f >= 0.4 else 1.0 - _smooth(0.06, 0.2, f))
         # Water content of forage: lush in the growing season, dry in winter and drought.
         self.forage_moisture = min(1.0, max(0.15, 0.2 + 0.55 * growth))
         self.bg_lum = 0.32 + 0.55 * self.snow
@@ -210,14 +256,78 @@ class World:
             "light": round(self.light, 3),
             "temperature": round(temp, 3),
             "snow": round(self.snow, 3),
+            "moult": round(self.moult, 3),
             "growth": round(growth, 3),
             "sunrise": round(sunrise, 2),
             "sunset": round(sunset, 2),
         }
 
+    def cold_heat(self, x: float, y: float) -> tuple[float, float]:
+        """How cold and how hot it is here (each 0 when not)."""
+        if self.climate.uniform:
+            return self.cold, self.heat  # the same everywhere (cold snaps included)
+        t = self.climate.temperature(self.season_temp, x, y)
+        return max(0.0, -t), max(0.0, t)
+
+    def ground_tone(self, x: float, y: float) -> tuple[float, float]:
+        """The ground's colour here, as the animals see it (lightness, yellow-blue):
+        sand, rock or leaf litter; or grass, green when growing, straw-coloured
+        when dead (autumn, winter, dry country) and earthy where grazed bare;
+        whitened by snow."""
+        cx = min(self.width - 1, max(0, int(x)))
+        cy = min(self.height - 1, max(0, int(y)))
+        kind = self.terrain.types.item(cy, cx)
+        if kind == SAND:
+            lum, yb = GROUND["sand"]
+        elif kind == ROCK:
+            lum, yb = GROUND["rock"]
+        elif kind == FOREST:
+            lum, yb = GROUND["forest"]
+        else:
+            k = self.veg.K.item(cy, cx)
+            cover = min(1.0, self.veg.B.item(cy, cx) / k) if k > 0 else 0.0
+            (sl, sy), (dl, dy), (gl, gy) = GROUND["soil"], GROUND["straw"], GROUND["lush"]
+            lum, yb = sl + (dl - sl) * cover, sy + (dy - sy) * cover  # dead grass, or bare earth where grazed
+            green = cover * (1.0 - 0.8 * self.grass_brown) * (1.0 - 0.8 * self.climate.dry_at(x, y))
+            lum, yb = lum + (gl - lum) * green, yb + (gy - yb) * green
+        snow = 0.92 * self.climate.snow_at(self.season_temp, x, y)
+        if snow > 0.0:
+            wl, wy = GROUND["snow"]
+            lum, yb = lum + (wl - lum) * snow, yb + (wy - yb) * snow
+        return lum, yb
+
+    def ground_lum(self, x: float, y: float) -> float:
+        return self.ground_tone(x, y)[0]
+
+    def coat_tone_now(self, a: Animal) -> tuple[float, float]:
+        """The coat's colour today: winter-white animals pale through the moult."""
+        if self._tones is None:
+            self._tones = [[coat_tone(c) for c in gs.coats] for gs in self.genomes]
+        lum, yb = self._tones[a.si][a.coat]
+        if a.moults and self.moult > 0.0:
+            m = self.moult
+            lum, yb = lum + (WINTER_LUM - lum) * m, yb + (WINTER_YB - yb) * m
+        return lum, yb
+
+    def coat_lum_now(self, a: Animal) -> float:
+        return self.coat_tone_now(a)[0]
+
+    def camouflage_gap(self, a: Animal) -> float:
+        """How different the coat looks from the ground under it (0 = a perfect match)."""
+        cl, cy = self.coat_tone_now(a)
+        gl, gy = self.ground_tone(a.x, a.y)
+        return math.hypot(cl - gl, CHROMA * (cy - gy))
+
     def visibility(self, a: Animal) -> float:
-        """How conspicuous an animal is: its coat's contrast with the ground, scaled by daylight."""
-        contrast = min(2.0, max(0.6, 0.8 + 1.4 * abs(a.coat_lum - self.bg_lum)))
+        """How conspicuous an animal is to a watching eye. Camouflage: the contrast
+        between its coat and the ground under it, so a brown hare on snow or a
+        white one on bare ground stands out, and the same hare on matching
+        ground does not. Moving breaks camouflage. In the dark, colour hardly
+        matters."""
+        contrast = min(2.0, max(0.6, 0.8 + 1.4 * self.camouflage_gap(a)))
+        if a.last_move > 0.0 and contrast < MOTION_SHOWS:
+            motion = min(1.0, a.last_move / max(0.05, 0.8 * a.speed))
+            contrast += (MOTION_SHOWS - contrast) * MOTION_WEIGHT * motion
         return 1.0 + (contrast - 1.0) * self.light
 
     # ------------------------------------------------------------------ geometry
@@ -266,15 +376,34 @@ class World:
             b.clear()
         huddle = self.huddle
         huddle.clear()
+        sight = [0.0] * len(self.species)
         for a in self.animals:
             if a.concealed:
                 huddle[(int(a.x), int(a.y))] += 1
+            if a.vision > sight[a.si]:
+                sight[a.si] = a.vision
             key = (int(a.x) >> BUCKET_SHIFT) + (int(a.y) >> BUCKET_SHIFT) * nbx
             bucket = self._buckets[a.si].get(key)
             if bucket is None:
                 self._buckets[a.si][key] = [a]
             else:
                 bucket.append(a)
+        # For each prey species, the buckets where a predator could be within
+        # sight of some member: elsewhere a prey animal's look-out can be skipped.
+        self.danger_zone = zones = [None] * len(self.species)
+        for si, predators in enumerate(self.predators_of):
+            if not predators:
+                continue
+            zone = zones[si] = set()
+            r = sight[si]
+            for pi in predators:
+                for key, members in self._buckets[pi].items():
+                    for p in members:
+                        bx0, bx1 = max(0, int(p.x - r)) >> BUCKET_SHIFT, int(min(self.width - 1, p.x + r)) >> BUCKET_SHIFT
+                        by0, by1 = max(0, int(p.y - r)) >> BUCKET_SHIFT, int(min(self.height - 1, p.y + r)) >> BUCKET_SHIFT
+                        for by in range(by0, by1 + 1):
+                            for bx in range(bx0, bx1 + 1):
+                                zone.add(bx + by * nbx)
 
     def query(self, species_idx, x: float, y: float, r: float, exclude=None) -> list:
         """Living animals of the given species within ``r`` of (x, y), as (dist^2, animal)."""
@@ -324,8 +453,10 @@ class World:
 
         Noticing is probabilistic: likelier for close, conspicuous prey, much
         less likely if the prey is frozen still, and a little less likely at
-        night, when foxes hunt by smell and hearing. Of the prey noticed, the
-        one with the lowest cost (route length x vulnerability) is chosen;
+        night, when foxes hunt by smell and hearing. It also depends on the
+        predator's search image: one that has met little of this prey lately is
+        slower to notice it, except right under its nose. Of the prey noticed,
+        the one with the lowest cost (route length x vulnerability) is chosen;
         prey only reachable by a long detour round water is passed over.
         """
         ignore = me._ignored(self)
@@ -335,11 +466,16 @@ class World:
         for d2, a in self.query(me.prey_idx, me.x, me.y, reach, exclude=me):
             if a.concealed or a is ignore or a is skip:
                 continue
-            p = PREY_SPOT * senses * self.visibility(a) * (1.0 - math.sqrt(d2) / me.vision)
+            d = math.sqrt(d2)
+            p = PREY_SPOT * senses * self.visibility(a) * (1.0 - d / me.vision)
             if a.act == Act.FREEZE:
                 p *= FROZEN_SPOT
+            if d > me.sp.rush_distance:
+                p *= me.search_image
             if self.rng.random() < p:
-                noticed.append((math.sqrt(d2) * (0.7 if not a.adult else 1.0), a.id, a))
+                noticed.append((d * (0.7 if not a.adult else 1.0), a.id, a))
+        if noticed:
+            me.search_image += SEARCH_IMAGE_GAIN * (1.0 - me.search_image)
         noticed.sort()
         best = None
         for _, _, a in noticed[:3]:
@@ -436,13 +572,83 @@ class World:
         ignore = me._ignored(self)
         candidates = sorted(
             (d2, a.id, a)
-            for d2, a in self.query((me.si,), me.x, me.y, me.sp.mate_range, exclude=me)
+            for d2, a in self.query((me.si,), me.x, me.y, self.mate_reach(me), exclude=me)
             if a.female != me.female and a is not ignore and a.ready_to_mate(self) and not self.related(me, a)
         )
         for d2, _, a in candidates[:3]:
             d = math.sqrt(d2)
             if self.clear_path(me.x, me.y, a.x, a.y) or self.find_path(me.x, me.y, a.x, a.y, 2.0 * d + 10.0):
                 return a
+        return None
+
+    # ------------------------------------------------------------------ courtship
+
+    def mate_quality(self, male: Animal) -> float:
+        """What a female can judge of a male: condition, size, health, injuries,
+        and (where males feed the family) his hunting skill and territory."""
+        q = (male.energy / male.max_energy) * (male.mass / male.sp.ref_mass) ** 0.5
+        q *= male.vigor * (1.0 - male.injury)
+        if male.sp.provisions:
+            q *= 0.75 + 0.25 * male.skill
+            if male.territorial and male.sp.territory_prey:
+                q *= min(1.3, max(0.7, self.prey_richness(male.si, male.home_x, male.home_y) ** 0.25))
+        return q
+
+    def acceptance(self, female: Animal, male: Animal) -> float:
+        """Chance she accepts him: certain for a typical healthy male in good
+        condition, falling off for weak, sick or injured ones, more steeply
+        in choosier species."""
+        q = self.mate_quality(male) / MATE_QUALITY_TYPICAL
+        return min(1.0, max(0.05, q ** (2.0 * female.sp.choosiness)))
+
+    def rank(self, a: Animal) -> float:
+        """Fighting ability: size, condition, health and freedom from injury."""
+        return a.mass * (0.5 + a.energy / a.max_energy) * a.vigor * (1.0 - a.injury)
+
+    def strongest_rival(self, male: Animal, female: Animal):
+        best, best_rank = None, 0.0
+        for _, a in self.query((male.si,), female.x, female.y, RIVAL_RADIUS, exclude=male):
+            if not a.female and a is not female and a.ready_to_mate(self) and not self.related(a, female):
+                r = self.rank(a)
+                if r > best_rank:
+                    best, best_rank = a, r
+        return best
+
+    def mating_contest(self, male: Animal, rival: Animal) -> bool:
+        """Two males competing for a female (rabbits' rank fights, foxes' mating-season
+        fights). Returns True if `male` wins and may court her."""
+        rm, rr = self.rank(male), self.rank(rival)
+        won = self.rng.random() < rm * rm / (rm * rm + rr * rr)
+        winner, loser = (male, rival) if won else (rival, male)
+        self.social[male.si]["mating contest"] += 1
+        self._event("fight", winner)
+        for a in (male, rival):
+            a.energy -= 0.5 * FIGHT_COST * a.max_energy
+        if self.rng.random() < 0.3:
+            loser.hurt(self, self.rng.uniform(0.05, 0.3))
+        loser._switch(Act.FLEE)
+        loser.threats = [((winner.x - loser.x) ** 2 + (winner.y - loser.y) ** 2, winner)]
+        loser.flee_until = self.tick + 15
+        loser.ignore, loser.ignore_until = None, self.tick
+        return won
+
+    def find_fruit(self, me: Animal):
+        """The nearest bush in view with ripe fruit on it, as a cell, or None."""
+        r, x, y = me.vision, me.x, me.y
+        x0, x1 = max(0, int(x - r)), min(self.width, int(x + r) + 1)
+        y0, y1 = max(0, int(y - r)), min(self.height, int(y + r) + 1)
+        window = self.fruit.F[y0:y1, x0:x1]
+        ok = window >= FRUIT_MIN
+        if not ok.any():
+            return None
+        ys, xs = np.nonzero(ok)
+        d2 = (xs + x0 + 0.5 - x) ** 2 + (ys + y0 + 0.5 - y) ** 2
+        for k in np.argsort(d2)[:4].tolist():
+            if d2[k] > r * r:
+                break
+            cell = (int(xs[k] + x0), int(ys[k] + y0))
+            if self.clear_path(x, y, cell[0] + 0.5, cell[1] + 0.5):
+                return cell
         return None
 
     def find_plant(self, me: Animal):
@@ -522,13 +728,17 @@ class World:
         return a <= f < b if a <= b else (f >= a or f < b)
 
     def prey_richness(self, si: int, x: float, y: float) -> float:
-        """Prey within a territory's width of (x, y), relative to the reference density."""
+        """Food within a territory's width of (x, y) (prey animals, plus voles as
+        rabbit-equivalents for species that eat them), relative to the reference."""
         sp = self.species[si]
         if not sp.territory_prey or not any(self._buckets[p] for p in self.prey_of[si]):
             return 1.0
-        n = sum(len(self.query((p,), x, y, sp.territory)) for p in self.prey_of[si])
+        food = float(sum(len(self.query((p,), x, y, sp.territory)) for p in self.prey_of[si]))
+        if sp.eats_voles and self.prey_of[si]:
+            prey = self.species[self.prey_of[si][0]]
+            food += self.voles.near(x, y, sp.territory) * VOLE_ENERGY / (prey.traits["mass"].mean * prey.carcass_energy)
         expected = sp.territory_prey / 1000.0 * math.pi * sp.territory ** 2
-        return n / expected
+        return food / expected
 
     def territory_spacing(self, si: int, x: float, y: float) -> float:
         """Territories are smaller where food is rich and larger where it is poor."""
@@ -568,6 +778,10 @@ class World:
         winner, loser = (intruder, resident) if won else (resident, intruder)
         winner.reward_events += FIGHT_WON
         loser.reward_events -= FIGHT_LOST
+        if self.rng.random() < 0.6:
+            loser.hurt(self, self.rng.uniform(0.1, 0.45))
+        if self.rng.random() < 0.25:
+            winner.hurt(self, self.rng.uniform(0.0, 0.15))
         if won:
             self.social[si]["takeover"] += 1
             self._holders[si].pop(resident.id, None)
@@ -588,44 +802,91 @@ class World:
         if self.rng.random() < FIGHT_DEATH[1 if self.in_season[si] else 0]:
             self.kill(loser, "fighting")
 
-    def settle(self, a: Animal, reach: float, here: bool = True) -> bool:
-        """Look for a territory within `reach`: first join a holder of the opposite
-        sex that has no mate (red foxes hold territories as pairs), then try where
-        the animal is (if `here`), then prospect a few spots round about."""
-        rng, half = self.rng, a.sp.territory / 2
-        holders = list(self._holders[a.si].values())
-        lone = []
-        for h in holders:
-            if h is a or h.female == a.female:
+    # Territories belong to pairs (red foxes live as a breeding pair and their
+    # family). Each territory has one centre, held by at most one male and one
+    # female; new territories keep their distance from all others. A territory
+    # that has lost one partner is a vacancy for a newcomer of that sex.
+
+    def territory_mates(self, a: Animal) -> list:
+        """The other holders of a's territory (its mate, if it has one)."""
+        return [h for h in self._holders[a.si].values()
+                if h is not a and h.home_x == a.home_x and h.home_y == a.home_y]
+
+    def open_territories(self, a: Animal, reach: float | None = None) -> list:
+        """Territories held by a lone animal of the opposite sex (unrelated to `a`),
+        nearest first, as (distance, home, occupants)."""
+        by_home = {}
+        for h in self._holders[a.si].values():
+            by_home.setdefault((h.home_x, h.home_y), []).append(h)
+        out = []
+        for home, occupants in by_home.items():
+            if any(h is a or h.female == a.female or self.related(a, h) for h in occupants):
                 continue
-            d = math.hypot(h.home_x - a.x, h.home_y - a.y)
-            if d <= reach and not any(o is not a and o.female == a.female and
-                                      math.hypot(o.home_x - h.home_x, o.home_y - h.home_y) < half for o in holders):
-                lone.append((d, h.id, h))
-        for _, _, h in sorted(lone):
-            if self.claim_territory(a, h.home_x, h.home_y):
+            d = math.hypot(home[0] - a.x, home[1] - a.y)
+            if reach is None or d <= reach:
+                out.append((d, home, occupants))
+        out.sort(key=lambda t: t[0])
+        return out
+
+    def settle(self, a: Animal, reach: float, here: bool = True, anywhere: bool = False) -> bool:
+        """Look for a territory: first a lone mate's territory within `reach` (or, if
+        `anywhere`, across the whole area), then a new territory where the animal is
+        (if `here`), then a few spots round about."""
+        for _, home, _ in self.open_territories(a, reach):
+            if self.claim_territory(a, *home):
                 return True
         if here and self.claim_territory(a, a.x, a.y):
             return True
+        rng = self.rng
         for _ in range(8):
             d, angle = rng.uniform(0.3, 1.0) * reach, rng.uniform(-math.pi, math.pi)
             x, y = a.x + d * math.cos(angle), a.y + d * math.sin(angle)
             if self.walkable(x, y) and self.claim_territory(a, x, y):
                 return True
+        if anywhere:
+            for _, home, _ in self.open_territories(a):
+                if self.claim_territory(a, *home):
+                    return True
         return False
 
     def claim_territory(self, a: Animal, x: float, y: float) -> bool:
-        """Settle a territory centred on (x, y) unless a same-sex holder is too close."""
-        r2 = self.territory_spacing(a.si, x, y) ** 2
-        for other in self._holders[a.si].values():
-            if other is not a and other.female == a.female:
-                dx, dy = other.home_x - x, other.home_y - y
-                if dx * dx + dy * dy < r2:
-                    return False
+        """Join the territory centred on (x, y) if its slot for a's sex is free, or
+        found a new one there if no other territory is too close."""
+        holders = self._holders[a.si]
+        occupants = [h for h in holders.values() if h is not a and h.home_x == x and h.home_y == y]
+        if occupants:
+            if any(h.female == a.female for h in occupants):
+                return False
+        else:
+            r2 = self.territory_spacing(a.si, x, y) ** 2
+            for other in holders.values():
+                if other is not a:
+                    dx, dy = other.home_x - x, other.home_y - y
+                    if dx * dx + dy * dy < r2:
+                        return False
         a.home_x, a.home_y = x, y
         a.territorial = True
-        self._holders[a.si][a.id] = a
+        holders[a.id] = a
         return True
+
+    def pair_up(self, male: Animal) -> bool:
+        """A lone territorial male moves in with a lone vixen nearby (she keeps the den)."""
+        if self.territory_mates(male):
+            return False
+        for d, home, occupants in self.open_territories(male, male.sp.territory):
+            if (home[0], home[1]) != (male.home_x, male.home_y):
+                male.home_x, male.home_y = home
+                self.social[male.si]["paired up"] += 1
+                return True
+        return False
+
+    def mate_reach(self, a: Animal) -> float:
+        """How far an animal looks for a mate. In the mating season, territorial
+        males range well beyond their territory looking for receptive females
+        (extra-territorial forays; Soulsbury et al. 2011)."""
+        if not a.female and a.sp.territory > 0:
+            return a.sp.mate_range * MATING_FORAY
+        return a.sp.mate_range
 
     def _event(self, kind: str, a: Animal) -> None:
         if len(self._events) < EVENT_LIMIT:
@@ -639,6 +900,7 @@ class World:
                 rec[key] = (value, a.id, name)
 
     def kill(self, a: Animal, cause: str) -> None:
+        self.ledger.death(a, cause)
         self._note_record(a)
         a.alive = False
         a.cause = cause
@@ -653,15 +915,18 @@ class World:
             for h in heirs:
                 h.helper_of = None
             if heirs:
+                # She takes her mother's place in the same territory.
                 heir = max(heirs, key=lambda h: h.age)
-                if self.claim_territory(heir, a.home_x, a.home_y):
-                    self.social[a.si]["inherited"] += 1
-                    for h in heirs:
-                        if h is not heir:
-                            h.helper_of = heir
+                heir.home_x, heir.home_y = a.home_x, a.home_y
+                heir.territorial = True
+                self._holders[a.si][heir.id] = heir
+                self.social[a.si]["inherited"] += 1
+                for h in heirs:
+                    if h is not heir:
+                        h.helper_of = heir
         self._deaths_pending = True
         self._event(cause, a)
-        self.narrator.windows[a.si].death(a, cause)
+        self.narrator.windows[a.si].death(a, cause, self.camouflage_gap(a))
         if cause in ("starvation", "dehydration", "old age", "disease") and self.predators_of[a.si]:
             # The body lies where it fell for two days, available to scavengers.
             self.carrion.append(Carrion(a.x, a.y, 0.6 * a.mass * a.sp.carcass_energy,
@@ -673,6 +938,7 @@ class World:
 
     def mate(self, a: Animal, b: Animal) -> None:
         female, male = (a, b) if a.female else (b, a)
+        self.matings[female.si] += 1
         female.pregnant = True
         female.gestation_left = female.gestation
         female.mate_genome = male.genome
@@ -680,9 +946,14 @@ class World:
         female.mate_genotype = male.genotype
         female.mate_id = male.id
         female.mate_generation = male.generation
+        female.mate_know = None
+        if self.teaching and male.brain_row >= 0:
+            k1, k2 = self.brains[male.si].know_how(male.brain_row)
+            female.mate_know = (k1.copy(), k2.copy())
         male.partner = female
         for x in (female, male):
             x.reward_events += REWARD_MATING * x.traits.get("libido", 1.0)
+            x.urge = 0.0  # sated
         female.refractory = max(female.sp.refractory, female.gestation)
         male.refractory = 0.1 * male.sp.refractory
         for x in (female, male):
@@ -699,12 +970,16 @@ class World:
             mother.pregnant = False
             mother.mate_genome = None
             return
-        budget = mother.energy * sp.investment
+        # Longer pregnancies (the gestation gene) give bigger, better-provisioned young.
+        g = mother.traits.get("gestation", 1.0)
+        budget = mother.energy * sp.investment * g
         share = budget / n
         generation = max(mother.generation, mother.mate_generation) + 1
+        lesson = self._lesson(mother) if self.teaching else None
         born = 0
         for _ in range(n):
-            genome = gs.child(mother.genome, mother.mate_genome, rng, self.cfg.mutation)
+            mutation = self.cfg.mutation * (self.cfg.evolution_speed if self.cfg.super_animals else 1.0)
+            genome = gs.child(mother.genome, mother.mate_genome, rng, mutation)
             expr = gs.express(genome, rng)
             # Viability selection: lethal genotypes and low-vigour embryos die before birth.
             if expr.lethal or rng.random() > expr.vigor:
@@ -719,6 +994,8 @@ class World:
             child = Animal(self, self._new_id(), mother.si, genome, expr, x, y,
                            generation=generation, mother_id=mother.id, father_id=mother.mate_id)
             child.home_x, child.home_y = mother.home_x, mother.home_y
+            child.birth_frac = BIRTH_MASS * g ** 3  # most fetal growth comes late in pregnancy
+            child._allometry()
             child.mother = mother
             # The young stay hidden in the nest where they were born.
             child.nest_x, child.nest_y = mother.x, mother.y
@@ -730,6 +1007,8 @@ class World:
             child.energy = min(share, child.max_energy)
             mother.energy -= child.energy
             child.water = 0.9 * child.max_water
+            if lesson is not None:
+                self._teach(child, lesson)
             self._born.append(child)
             mother.children_ids.append(child.id)
             self._event("birth", child)
@@ -744,9 +1023,34 @@ class World:
         mother.next_nurse = self.tick + mother.sp.nurse_interval
         if born:
             self.max_generation[mother.si] = max(self.max_generation[mother.si], generation)
+            self.ledger.parents(mother, mother.mate_traits, born)
         mother.pregnant = False
         mother.mate_genome = None
+        mother.mate_know = None
         self.births[mother.si] += born
+
+    @property
+    def teaching(self) -> bool:
+        """Super animals mode: young start life with part of their parents' know-how."""
+        return self.cfg.super_animals and self.cfg.inherit_learning > 0
+
+    def _lesson(self, mother: Animal) -> dict:
+        """What a litter is taught: a share of both parents' know-how (brain wiring
+        learned or inherited beyond the genes) and of the mother's skills."""
+        share = self.cfg.inherit_learning
+        out = {"experience": share * mother.experience, "skill": share * mother.skill, "brain": None}
+        if self.brains is not None and mother.brain_row >= 0:
+            k1, k2 = self.brains[mother.si].know_how(mother.brain_row)
+            if mother.mate_know is not None:
+                k1, k2 = 0.5 * (k1 + mother.mate_know[0]), 0.5 * (k2 + mother.mate_know[1])
+            out["brain"] = (share * k1, share * k2)
+        return out
+
+    def _teach(self, child: Animal, lesson: dict) -> None:
+        child.experience = lesson["experience"]
+        child.skill = lesson["skill"]
+        if lesson["brain"] is not None and child.brain_row >= 0:
+            self.brains[child.si].teach(child.brain_row, *lesson["brain"])
 
     # ------------------------------------------------------------------ sandbox tools
 
@@ -762,6 +1066,9 @@ class World:
             self._event("birth", a)
             ids.append(a.id)
         self._flush()
+        self.arrivals[si] += len(ids)
+        if ids:
+            self.ledger.action("added", amount=len(ids), species=self.species[si].name)
         return ids
 
     def remove_area(self, x: float, y: float, radius: float) -> int:
@@ -771,16 +1078,22 @@ class World:
                 self.kill(a, "removed")
                 n += 1
         self._flush()
+        if n:
+            self.ledger.action("removed animals", amount=n)
         return n
 
     def fertilise(self, x: float, y: float, radius: float) -> None:
         self.veg.fertilise(x, y, radius)
+        self.ledger.action("fertilised plants")
 
     def paint(self, x: float, y: float, radius: float, kind: str) -> int:
         changed = self.terrain.paint(x, y, radius, PAINTABLE[kind], self.nrng)
         if not changed:
             return 0
+        self.ledger.action("painted terrain", detail=kind, amount=changed)
         self.veg.refresh_capacity(self.terrain)
+        self.fruit.refresh(self.terrain)
+        self._biomes = None
         if kind in ("grass", "sand"):
             self.veg.fertilise(x, y, radius)
         self._index_land()
@@ -816,7 +1129,13 @@ class World:
         for si, s in enumerate(self.species):
             for _ in range(s.initial):
                 self._add(self._founder(si, self._land, mature=False))
+        self._base_power = [self._mean_power(si) for si in range(len(self.species))]
+        self.alphas = [[] for _ in self.species]
         self._record()
+        self.ledger = Ledger(self, CAUSES)
+        self.ledger.action("repopulated")
+        self.ledger.counts_changed(self.counts())
+        self.ledger.record()
         counts = ", ".join(f"{s.initial} {s.name}s" if not s.name.endswith("x") else f"{s.initial} {s.name}es"
                            for s in self.species)
         self.narrator.restart(f"{counts} were released with fresh genomes drawn from the founding allele frequencies. "
@@ -834,6 +1153,7 @@ class World:
         if female.pregnant:
             return "She is already pregnant."
         self.mate(a, b)
+        self.ledger.action("lab", detail="forced a mating", species=a.sp.name)
         return None
 
     def clone(self, a: Animal) -> int | None:
@@ -849,6 +1169,8 @@ class World:
         self._born.append(child)
         self._event("birth", child)
         self._flush()
+        self.arrivals[a.si] += 1
+        self.ledger.action("lab", detail="cloned an animal", species=a.sp.name)
         return child.id
 
     def edit_gene(self, a: Animal, symbol: str, alleles: tuple[str, str]) -> None:
@@ -859,12 +1181,15 @@ class World:
         a.coat = expr.coat
         a.coat_lum = gs.coats[expr.coat].lum
         a.vigor = expr.vigor
+        a.moults = MOULTS[a.sp.coat](expr.genotype)
         a._allometry()
+        self.ledger.action("lab", detail=f"edited the {symbol} gene", species=a.sp.name)
 
     def trigger(self, kind: str, si: int | None = None) -> None:
         tpd = self.cfg.ticks_per_day
         self.event_log.append({"tick": self.tick, "day": self.env["day"], "kind": kind,
                                "species": None if si is None else self.species[si].name})
+        self.ledger.action("event", detail=kind, species=None if si is None else self.species[si].name)
         if kind == "bloom":
             self.veg.B[:] = self.veg.K
             return
@@ -918,7 +1243,10 @@ class World:
         if self.effects:
             self._apply_effects()
         self._environment()
-        self.veg.step(self.growth)
+        self.ledger.tick()
+        self.veg.step(self.climate.growth(self.growth, self.season_temp, self.tick))
+        self.fruit.step(Fruit.ripeness(self.env["year_fraction"], self.cfg.seasons))
+        self.voles.step(self.veg, Voles.breeding(self.env["year_fraction"], self.cfg.seasons))
         self._rebuild_buckets()
         self._think()
         order = self.animals[:]
@@ -931,6 +1259,7 @@ class World:
             if self.rng.random() < self.cfg.immigration:
                 self._add(self._founder(si, self._edge, mature=True))
                 self.narrator.windows[si].arrivals += 1
+                self.arrivals[si] += 1
         if self.carrion and self.tick % 20 == 0:
             self.carrion = [c for c in self.carrion if c.energy > 0.0 and c.until > self.tick]
         if self.caches and self.tick % 10 == 0:
@@ -938,7 +1267,9 @@ class World:
             for c in self.caches:
                 c.energy *= spoil
             self.caches = [c for c in self.caches if c.energy > 5.0 and c.until > self.tick]
-        for si, n in enumerate(self.counts()):
+        counts = self.counts()
+        self.ledger.counts_changed(counts)
+        for si, n in enumerate(counts):
             if n:
                 self.ever[si] = True
             elif self.ever[si] and self.end_on_extinction and self.finished is None:
@@ -947,6 +1278,8 @@ class World:
             self.narrator.observe()
         if self.tick % self._interval == 0:
             self._record()
+        if self.tick % self.cfg.ticks_per_day == 0:
+            self.ledger.record()
 
     # ------------------------------------------------------------------ statistics
 
@@ -965,6 +1298,7 @@ class World:
             if a.alive and a.mother is None:
                 a.sense(self)
                 groups[a.si].append(a)
+        self._thought = [None] * len(self.species)
         for si, members in enumerate(groups):
             if not members:
                 continue
@@ -985,15 +1319,22 @@ class World:
                     choice, probs = brain.policy(scores, mask, current, self.nrng)
                     value = table.value(rows, hidden)
                     reward = np.array([a.reward for a in members], dtype=np.float32)
-                    plasticity = np.array([a.plasticity() for a in members], dtype=np.float32)
+                    young = brain.YOUNG_PLASTICITY
+                    boost = self.cfg.learning_speed if self.cfg.super_animals else 1.0
+                    plasticity = np.array([boost * a.traits.get("learning", 0.25) / 0.25 * (1.0 if a.adult else young)
+                                           for a in members], dtype=np.float32)
                     delta = table.learn(rows, x, hidden, value, reward, plasticity, choice, probs, mask)
-                    for k, a in enumerate(members):
-                        a.surprise = float(delta[k])
-                        a.value_now = float(value[k])
+                    due = []
+                    tick = self.tick
+                    for a, d, v in zip(members, delta.tolist(), value.tolist()):
+                        a.surprise = d
+                        a.value_now = v
                         a.wellbeing += 0.02 * (a.reward - a.wellbeing)
-                        a.surprise_avg += 0.02 * (abs(a.surprise) - a.surprise_avg)
-                        if (self.tick + a.id) % BRAIN_LOG_EVERY == 0:
-                            self._log_brain(a, table)
+                        a.surprise_avg += 0.02 * (abs(d) - a.surprise_avg)
+                        if (tick + a.id) % BRAIN_LOG_EVERY == 0:
+                            due.append(a)
+                    if due:
+                        self._log_brains(due, table)
                 else:
                     choice = greedy
                 clear = brain.margin(instinct, mask) >= brain.CLEAR
@@ -1005,45 +1346,50 @@ class World:
                 pairs = self.choice_pairs[si]
                 for k in differ.tolist():
                     pairs[(int(rule_choice[k]), int(greedy[k]))] += 1
-            choice = choice.tolist()
-            rule_choice = rule_choice.tolist()
-            for k, a in enumerate(members):
-                a.planned = choice[k]
-                a.rule_choice = rule_choice[k]
-                a.scores = scores[k]
-                a.hidden = None if hidden is None else hidden[k]
+            self._thought[si] = (scores, hidden)
+            for k, (a, c, rc) in enumerate(zip(members, choice.tolist(), rule_choice.tolist())):
+                a.planned = c
+                a.rule_choice = rc
+                a.think_k = k
 
     def _learned(self, a: Animal, table) -> tuple[float, float]:
         """How far an animal's wiring has moved from what it was born with (RMS),
         and in what share of its recent situations it now decides differently."""
-        row = a.brain_row
-        d1 = table.w1[row] - table.i1[row]
-        d2 = table.w2[row] - table.i2[row]
-        change = float(np.sqrt((np.sum(d1 * d1) + np.sum(d2 * d2)) / brain.N_WEIGHTS))
-        if not a.recent:
-            return change, 0.0
-        x = np.array([s for s, _ in a.recent], dtype=np.float32)
-        mask = np.array([m for _, m in a.recent], dtype=bool)
+        changes, differs = self._learned_many([a], table)
+        return changes[0], differs[0]
+
+    def _learned_many(self, animals: list, table) -> tuple[list, list]:
+        """`_learned` for a batch of animals, in one batched calculation."""
+        rows = np.array([a.brain_row for a in animals])
+        d1 = table.w1[rows] - table.i1[rows]
+        d2 = table.w2[rows] - table.i2[rows]
+        changes = np.sqrt(((d1 * d1).sum(axis=(1, 2)) + (d2 * d2).sum(axis=(1, 2))) / brain.N_WEIGHTS).tolist()
+        owner = [k for k, a in enumerate(animals) for _ in a.recent]
+        if not owner:
+            return changes, [0.0] * len(animals)
+        x = np.array([s for a in animals for s, _ in a.recent], dtype=np.float32)
+        mask = np.array([m for a in animals for _, m in a.recent], dtype=bool)
+        owner = np.array(owner)
+        r = rows[owner]
+        now, _ = brain.forward(x, table.w1[r], table.w2[r])
+        born, _ = brain.forward(x, table.i1[r], table.i2[r])
         none = np.full(len(x), -1)
-        n = len(x)
-        now, _ = brain.forward(x, np.broadcast_to(table.w1[row], (n,) + table.w1.shape[1:]),
-                               np.broadcast_to(table.w2[row], (n,) + table.w2.shape[1:]))
-        born, _ = brain.forward(x, np.broadcast_to(table.i1[row], (n,) + table.i1.shape[1:]),
-                                np.broadcast_to(table.i2[row], (n,) + table.i2.shape[1:]))
         # Only situations where its inborn wiring had a clear preference count:
         # close calls flip with the slightest change.
         clear = brain.margin(born, mask) >= brain.CLEAR
-        if not clear.any():
-            return change, 0.0
-        differs = float(np.mean((brain.choose(now, mask, none) != brain.choose(born, mask, none))[clear]))
-        return change, differs
+        changed = (brain.choose(now, mask, none) != brain.choose(born, mask, none)) & clear
+        n_clear = np.bincount(owner, weights=clear, minlength=len(animals))
+        n_changed = np.bincount(owner, weights=changed, minlength=len(animals))
+        differs = np.where(n_clear > 0, n_changed / np.maximum(n_clear, 1), 0.0).tolist()
+        return changes, differs
 
-    def _log_brain(self, a: Animal, table) -> None:
-        change, differs = self._learned(a, table)
-        a.brain_log.append([round(a.age / self.cfg.ticks_per_day, 2), round(a.wellbeing * 1000, 3),
-                            round(a.surprise_avg * 1000, 3), round(change, 4), round(differs, 3)])
-        if len(a.brain_log) > 160:
-            del a.brain_log[::2]  # keep the whole life, at lower resolution
+    def _log_brains(self, animals: list, table) -> None:
+        tpd = self.cfg.ticks_per_day
+        for a, change, differs in zip(animals, *self._learned_many(animals, table)):
+            a.brain_log.append([round(a.age / tpd, 2), round(a.wellbeing * 1000, 3),
+                                round(a.surprise_avg * 1000, 3), round(change, 4), round(differs, 3)])
+            if len(a.brain_log) > 160:
+                del a.brain_log[::2]  # keep the whole life, at lower resolution
 
     def counts(self) -> list[int]:
         out = [0] * len(self.species)
@@ -1053,7 +1399,7 @@ class World:
 
     def _reset_history(self) -> None:
         self._interval = self.cfg.stats_interval
-        self.history = {"tick": [], "plants": [], "species": {}}
+        self.history = {"tick": [], "plants": [], "voles": [], "species": {}}
         for s in self.species:
             self.history["species"][s.name] = {
                 "count": [],
@@ -1074,6 +1420,7 @@ class World:
         h = self.history
         h["tick"].append(self.tick)
         h["plants"].append(round(self.veg.total(), 1))
+        h["voles"].append(round(self.voles.total()))
         groups = [[] for _ in self.species]
         for a in self.animals:
             groups[a.si].append(a)
@@ -1137,9 +1484,41 @@ class World:
                 row["diversity"]["ho"].append(None)
                 row["vigor"].append(None)
                 row["load"].append(None)
+        if self.cfg.super_animals:
+            self._update_alphas()
         if len(h["tick"]) > HISTORY_LIMIT:
             self._thin(h)
             self._interval *= 2
+
+    def power(self, a: Animal) -> float:
+        """Overall prowess relative to the founders: speed, senses, size, health,
+        condition, experience and quickness to learn."""
+        ref = self.species[a.si].traits
+        t = a.traits
+        p = (t["speed"] / ref["speed"].mean) * (t["vision"] / ref["vision"].mean) ** 0.5
+        p *= (t["mass"] / ref["mass"].mean) ** 0.5 * a.vigor * (1.0 - a.injury) * (0.5 + a.energy / a.max_energy)
+        p *= (0.5 + a.skill) if self.prey_of[a.si] else (0.5 + a.experience)
+        if "learning" in t:
+            p *= (t["learning"] / ref["learning"].mean) ** 0.5
+        return p
+
+    def _mean_power(self, si: int) -> float:
+        adults = [a for a in self.animals if a.si == si and a.adult]
+        return sum(self.power(a) for a in adults) / len(adults) if adults else 1.0
+
+    def relative_power(self, a: Animal) -> float:
+        """Prowess relative to the average founding adult of its species."""
+        return self.power(a) / max(1e-9, self._base_power[a.si])
+
+    def _update_alphas(self) -> None:
+        """Super animals mode: crown the three strongest adults of each species."""
+        for si, sp in enumerate(self.species):
+            adults = [a for a in self.animals if a.si == si and a.adult and a.alive]
+            ranked = sorted(adults, key=self.power, reverse=True)[:3]
+            old = self.alphas[si][0] if self.alphas[si] else None
+            self.alphas[si] = [a.id for a in ranked]
+            if ranked and ranked[0].id != old:
+                self.narrator.new_alpha(si, ranked[0], self.relative_power(ranked[0]))
 
     def _record_learning(self, si: int, members: list, out: dict) -> None:
         """Population averages of lifetime learning, from a sample of animals."""
@@ -1150,9 +1529,9 @@ class World:
             return
         table = self.brains[si]
         rows = [a.brain_row for a in free]
-        learned = [self._learned(a, table) for a in free]
-        out["learned"].append(round(sum(c for c, _ in learned) / len(learned), 4))
-        out["differs"].append(round(sum(d for _, d in learned) / len(learned), 4))
+        changes, differs = self._learned_many(free, table)
+        out["learned"].append(round(sum(changes) / len(changes), 4))
+        out["differs"].append(round(sum(differs) / len(differs), 4))
         prey = bool(self.predators_of[si])
         born = brain.thresholds(table.i1[rows], table.i2[rows], prey)
         now = brain.thresholds(table.w1[rows], table.w2[rows], prey)
@@ -1187,6 +1566,8 @@ class World:
             "types": _b64(t.types),
             "heights": _b64(np.clip(t.heights * 20, 0, 255)),
             "fertility": _b64(t.fertility * 255),
+            "bushes": self.fruit.encode_bushes(),
+            "climate": self.climate.payload(),
         }
 
     def describe(self) -> dict:
@@ -1228,6 +1609,10 @@ class World:
             "clock": {"ticks_per_day": self.cfg.ticks_per_day, "days_per_year": self.cfg.days_per_year,
                       "seasons": self.cfg.seasons},
             "settings": settings_of(self.cfg),
+            "climate": {"name": self.climate.name, "label": self.climate.spec["label"], "icon": self.climate.spec["icon"],
+                        "text": self.climate.spec["text"]},
+            "climates": {k: {"label": v["label"], "icon": v["icon"], "text": v["text"], "terrain": v["terrain"],
+                             "animals": v["animals"]} for k, v in CLIMATES.items()},
             "brain": {"inputs": list(brain.INPUTS) + ["bias"], "options": list(brain.OPTIONS), "hidden": brain.N_HID,
                       "mode": self.cfg.brains, "learning": self.cfg.brains == "neural" and self.cfg.learning,
                       "training": brain.training_report()},
@@ -1241,7 +1626,8 @@ class World:
             "animals": [
                 [a.id, a.si, round(a.x, 2), round(a.y, 2), round(a.heading, 2), int(a.act),
                  int(a.female) | (a.pregnant << 1) | ((not a.adult) << 2) | (a.scanning << 3)
-                 | (a.stalking << 4) | (a.concealed << 5) | ((a.act == Act.CACHE and a.carried > 0) << 6), a.coat,
+                 | (a.stalking << 4) | (a.concealed << 5) | ((a.act == Act.CACHE and a.carried > 0) << 6)
+                 | ((a.id in self.alphas[a.si]) << 7) | (a.moults << 8), a.coat,
                  round((a.mass / a.sp.ref_mass) ** (1 / 3), 2), round(a.vision, 1)]
                 for a in self.animals
             ],
@@ -1264,6 +1650,7 @@ class World:
         self._events = []
         if plants:
             out["plants"] = self.veg.encode()
+            out["fruit"] = self.fruit.encode()
         if insights_since is not None:
             out["insights"] = self.narrator.since(insights_since)
         return out
@@ -1316,11 +1703,16 @@ class World:
             "litter": sum(1 for k in a.litter if k.alive and k.mother is a),
             "next_nurse": max(0, a.next_nurse - self.tick) if a.litter else None,
             "fear": round(a.fear, 2),
+            "injury": round(a.injury, 2),
+            "lame": a.lame > 0,
+            "sight": round(a.sight(), 2),
             "partner": self._ref(a.partner.id) if a.partner is not None else None,
             "caches": sum(1 for c in self.caches if c.owner == a.id),
             "route": [[round(x, 2), round(y, 2)] for x, y in a.path[:40]] if a.path else None,
             "territory": None if a.sp.territory <= 0 or not a.adult else a.territorial,
             "role": self._role(a),
+            "alpha": (self.alphas[a.si].index(a.id) + 1) if a.id in self.alphas[a.si] else None,
+            "power": round(self.relative_power(a), 2) if self.cfg.super_animals and a.adult else None,
             "helpers": self.helpers_of(a) if a.territorial and a.female else 0,
             "generation": a.generation,
             "mother": self._ref(a.mother_id),
@@ -1335,11 +1727,14 @@ class World:
             "energy": round(a.energy / a.max_energy, 3),
             "water": round(a.water / a.max_water, 3),
             "stamina": round(a.stamina / a.max_stamina, 3),
+            "urge": round(a.urge, 3),
             "upkeep": round(a.upkeep * a.thermal_cost(self), 4),
             "traits": {t: {"value": round(v, 3), "genetic": round(a.sp.traits[t].mean * a.breeding[t], 3)}
                        for t, v in a.traits.items()},
             "coat": gs.coats[a.coat].name,
             "visibility": round(self.visibility(a), 2),
+            "winter_white": a.moults,
+            "place": self._place(a),
             "genes": genes,
             "vigor": round(a.vigor, 3),
             "load": a.load,
@@ -1350,6 +1745,21 @@ class World:
             "brain": self._brain_view(a),
             "memory": self._memory_view(a),
         }
+
+    def _land_mask(self) -> np.ndarray:
+        return WALKABLE_TYPES[self.terrain.types]
+
+    def _place(self, a: Animal) -> dict:
+        """The climate where the animal is: biome, temperature, snow and ground."""
+        cx = min(self.width - 1, max(0, int(a.x)))
+        cy = min(self.height - 1, max(0, int(a.y)))
+        if self._biomes is None:
+            self._biomes = self.climate.biomes(self.terrain)
+        return {"biome": BIOMES[self._biomes[cy, cx]],
+                "temperature": round(self.climate.temperature(self.season_temp, a.x, a.y), 2),
+                "snow": round(self.climate.snow_at(self.season_temp, a.x, a.y), 2),
+                "ground": round(self.ground_lum(a.x, a.y), 2), "coat": round(self.coat_lum_now(a), 2),
+                "camouflage": round(self.camouflage_gap(a), 2)}
 
     def _role(self, a: Animal) -> str | None:
         if a.sp.territory <= 0 or not a.adult:
@@ -1363,14 +1773,20 @@ class World:
     def _brain_view(self, a: Animal) -> dict | None:
         if a.inputs is None:
             return None
+        batch = self._thought[a.si]
+        if batch is not None and 0 <= a.think_k < len(batch[0]):
+            scores = batch[0][a.think_k]
+            hidden = None if batch[1] is None else batch[1][a.think_k]
+        else:
+            scores = hidden = None
         out = {
             "mode": self.cfg.brains,
             "inputs": [round(float(v), 3) for v in a.inputs] + [1.0],
             "mask": list(a.mask),
-            "scores": None if a.scores is None else [round(float(v), 3) for v in a.scores],
+            "scores": None if scores is None else [round(float(v), 3) for v in scores],
             "choice": a.planned,
             "instinct": a.rule_choice,
-            "hidden": None if a.hidden is None else [round(float(v), 3) for v in a.hidden],
+            "hidden": None if hidden is None else [round(float(v), 3) for v in hidden],
         }
         if self.brains is not None and a.brain_row >= 0:
             table = self.brains[a.si]
@@ -1391,7 +1807,7 @@ class World:
             out["value"] = round(a.value_now, 3)
             out["surprise"] = round(a.surprise, 4)
             out["reward"] = round(a.reward, 4)
-            out["plasticity"] = round(a.plasticity(), 2)
+            out["plasticity"] = round(a.plasticity() * (self.cfg.learning_speed if self.cfg.super_animals else 1.0), 2)
             # Why it chose what it did: how much each sense pushed that option up or down.
             x = np.array(a.inputs + [1.0], dtype=np.float32)
             out["why"] = [round(float(v), 3) for v in brain.attributions(x, w1, w2, a.planned)]
@@ -1421,8 +1837,23 @@ class World:
                 if value >= 0.05:
                     out.append([(key % self.region_cols) * REGION, (key // self.region_cols) * REGION, round(value, 2)])
             return out
+        # Things it does that can be shown on the map: its food caches (and its
+        # den's larder), its den, its territory, its scent marks and its mate.
+        mate = a.partner if a.partner is not None and a.partner.alive else None
+        if mate is None and a.female:
+            mate = next((m for m in self._holders[a.si].values() if m.partner is a and m.alive), None)
+        caches = [[round(c.x, 2), round(c.y, 2), round(c.energy), c.den == a.id or (mate is not None and c.den == mate.id)]
+                  for c in self.caches if c.energy > 0 and (c.owner == a.id or c.den == a.id)]
+        young = a.litter and any(k.alive and k.mother is a for k in a.litter)
         return {
             "region": REGION,
+            "caches": caches[:60],
+            "den": [round(a.nest_x, 2), round(a.nest_y, 2)] if young else None,
+            "territory": [round(a.home_x, 2), round(a.home_y, 2), a.sp.territory / 2]
+            if a.sp.territory > 0 and a.territorial else None,
+            "marks": [[x, y] for x, y, t in a.marks if self.tick - t < 3 * self.cfg.ticks_per_day],
+            "mate": [round(mate.x, 2), round(mate.y, 2)] if mate is not None else None,
+            "helpers": [[round(h.x, 2), round(h.y, 2)] for h in self.animals if h.helper_of is a][:4],
             "food": regions(a.food_mem, FOOD_MEMORY_DAYS),
             "danger": regions(a.danger_mem, DANGER_MEMORY_DAYS),
             "experience": round(a.experience, 3),

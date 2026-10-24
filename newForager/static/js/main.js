@@ -7,7 +7,8 @@ import { $, ACT_EMOJI, TOOLS, UI } from "./ui.js";
 // At 1x the world runs 4 ticks per second, so one simulated day lasts a minute
 // and animals walk at a natural-looking pace.
 const BASE_TPS = 4;
-const BUFFER_SECONDS = 0.3;
+const FRAME_MS = 120; // how often to fetch the latest state while running
+const SKIP_FRAME_MS = 500; // ...and while skipping ahead (fewer frames leave more time for simulating)
 const SPEEDS = [[0.5, "½×"], [1, "1×"], [2, "2×"], [5, "5×"], [10, "10×"], [25, "25×"], [60, "Max"]];
 const EVENT_COLORS = {
   birth: "#ff8fb8", predation: "#d64545", starvation: "#a39e93", dehydration: "#d9b56b",
@@ -45,11 +46,16 @@ class App {
     this.selected = null;
     this.detail = null;
     this.hist = null;
+    this.ledger = null; // daily records (births, deaths by cause, adults, food), for the AI and Deaths tabs
+    this._ledgerTick = -Infinity;
     this.busy = false;
     this.rendered = [];
     this.prev = new Map();
     this.curr = [];
     this.tPrev = this.tCurr = this.renderTick = 0;
+    this.rate = 0; // ticks per second the server is actually achieving, measured from frames
+    this.frameAt = 0;
+    this.clock = null;
     this.plantsAt = 0;
     this.trail = [];
     this.lastInsight = 0;
@@ -71,6 +77,10 @@ class App {
     return BASE_TPS * this.speed;
   }
 
+  get skipping() {
+    return !!this.clock?.skip;
+  }
+
   async start() {
     try {
       await this.load(await api("/api/world"));
@@ -81,6 +91,9 @@ class App {
     this.last = performance.now();
     requestAnimationFrame((t) => this.loop(t));
     setInterval(() => { if (this.running || !this.hist) this.pullHistory(); }, 1000);
+    setInterval(() => {
+      if (!$("#drawer").hidden && (this.ui.tab === "ai" || this.ui.tab === "deaths")) this.pullLedger();
+    }, 2000);
   }
 
   async load(info) {
@@ -89,15 +102,18 @@ class App {
     this.w3.setTerrain(info, info.terrain);
     this.animals?.dispose();
     this.animals = new Animals(this.w3, info, () => this.w3.toon(0xffffff));
+    this.ledger = null;
+    this._ledgerTick = -Infinity;
     this.ui.build(info);
     this.hist = null;
     this.selected = null;
     this.detail = null;
     this.prev = new Map();
     this.curr = [];
-    const f = await api("/api/step", { ticks: 0, plants: true });
+    const f = await api("/api/frame", { plants: true });
     this.renderTick = this.tPrev = f.tick;
     this.applyFrame(f);
+    await this.sendClock({ running: this.running, speed: this.speedValue() });
     this.prev = new Map(this.curr.map((a) => [a.id, a]));
     await this.pullHistory();
     const log = await api("/api/insights");
@@ -106,15 +122,17 @@ class App {
     this._applyUrlOptions();
   }
 
-  // ?inspect=fox selects (and follows) an animal of that species (&tab=brain
+  // ?inspect=fox (or an animal's id) selects and follows it (&tab=brain
   // opens an inspector tab, &memory=1 shows its memory map); ?data=genes opens
   // the data drawer on a tab. Handy for sharing a view.
   _applyUrlOptions() {
     const params = new URLSearchParams(location.search);
     const species = params.get("inspect");
     if (species) {
+      // ?inspect=fox picks a grown fox; ?inspect=1234 picks that animal.
       const si = this.info.species.findIndex((s) => s.name === species);
-      const a = this.curr.find((c) => c.si === si && !(c.flags & 4));
+      const a = /^\d+$/.test(species) ? this.curr.find((c) => c.id === Number(species))
+        : this.curr.find((c) => c.si === si && !(c.flags & 4));
       if (a) {
         this.select(a.id).then(() => {
           this.follow = true;
@@ -140,27 +158,59 @@ class App {
 
   // ------------------------------------------------------------------ simulation clock
 
+  // The server runs the simulation on its own clock; the browser sets the
+  // speed and fetches the latest state a few times a second.
+  speedValue() {
+    return this.speed >= 60 ? "max" : this.speed;
+  }
+
+  async sendClock(body) {
+    try {
+      this.clock = await api("/api/clock", body);
+      this.ui.updateSimClock(this.clock);
+    } catch (err) {
+      this.ui.toast(err.message, "error");
+    }
+  }
+
   setSpeed(v) {
     this.speed = v;
-    if (!this.running) this.togglePlay();
+    this.running = true;
     this.ui.buildSpeeds();
+    this.sendClock({ speed: this.speedValue(), running: true });
   }
 
   togglePlay() {
+    if (this.skipping) return this.cancelSkip();
     this.running = !this.running;
     this.ui.buildSpeeds();
+    this.sendClock({ running: this.running, speed: this.speedValue() });
   }
 
-  async requestFrame(ticks) {
+  async skip(days) {
+    $("#skip-menu").hidden = true;
+    await this.sendClock({ skip_days: days, speed: this.speedValue() });
+    this.ui.toast(`⏩ Skipping ahead ${days >= 12 ? `${days / 12} year${days > 12 ? "s" : ""}` : `${days} day${days > 1 ? "s" : ""}`}. Every tick is still simulated in full.`);
+  }
+
+  cancelSkip() {
+    return this.sendClock({ cancel_skip: true });
+  }
+
+  // Kept for the sandbox tools: refresh the view now (the clock does the stepping).
+  requestFrame() {
+    return this.fetchFrame();
+  }
+
+  async fetchFrame() {
     if (this.busy) return;
     this.busy = true;
-    const plants = performance.now() - this.plantsAt > 450;
+    this.frameAt = performance.now();
+    const plants = performance.now() - this.plantsAt > (this.skipping ? 1500 : 450);
     try {
-      const f = await api("/api/step", { ticks, selected: this.selected, plants, insights_since: this.lastInsight });
+      const f = await api("/api/frame", { selected: this.selected, plants, insights_since: this.lastInsight });
       this.applyFrame(f);
     } catch (err) {
-      this.running = false;
-      this.ui.buildSpeeds();
       this.ui.toast(err.message, "error");
     } finally {
       this.busy = false;
@@ -168,6 +218,29 @@ class App {
   }
 
   applyFrame(f) {
+    // How fast the simulation is really going, from the ticks between frames.
+    const now = performance.now();
+    if (this._lastFrame && f.tick >= this._lastFrame.tick) {
+      const dt = (now - this._lastFrame.at) / 1000;
+      if (dt > 0.02) this.rate += 0.35 * ((f.tick - this._lastFrame.tick) / dt - this.rate);
+    }
+    this._lastFrame = { tick: f.tick, at: now };
+    if (f.clock) {
+      if (this.clock?.skip && !f.clock.skip) {
+        const tpd = this.info.clock.ticks_per_day;
+        this.ui.toast(`⏩ Skipped ahead to day ${Math.floor((f.tick + tpd / 4) / tpd) + 1}.`);
+        this.pullHistory();
+      }
+      this.clock = f.clock;
+      if (this.running && !f.clock.running) {
+        this.running = false; // the run ended (or a skip finished while paused)
+        this.ui.buildSpeeds();
+      } else if (!this.running && f.clock.running && !f.clock.skip) {
+        this.running = true;
+        this.ui.buildSpeeds();
+      }
+      this.ui.updateSimClock(f.clock);
+    }
     // Freeze what is on screen now as the start of the next interpolation.
     this.prev = new Map(this.rendered.map((a) => [a.id, a]));
     this.tPrev = Math.min(this.renderTick, this.tCurr || this.renderTick);
@@ -176,11 +249,13 @@ class App {
     if (this.renderTick > this.tCurr) this.renderTick = this.tCurr;
     this.frame = f;
     this.env = f.env;
+    if (this.animals) this.animals.moult = f.env.moult || 0;
     if (f.plants) {
       this.plantsAt = performance.now();
       this.w3.updateGround(decode(f.plants), f.env);
+      if (f.fruit) this.w3.updateFruit(decode(f.fruit));
     }
-    if (f.terrain_version !== this.w3.version) this.reloadTerrain();
+    if (f.terrain_version !== this.w3.version) this._terrainDirty = true;
     for (const [kind, x, y, , id] of f.events) {
       if (kind === "pounce") {
         this.animals.pounce(id);
@@ -220,9 +295,11 @@ class App {
   async reloadTerrain() {
     if (this._terrainBusy) return;
     this._terrainBusy = true;
+    this._terrainDirty = false;
+    this._terrainAt = performance.now();
     try {
       const t = await api("/api/terrain");
-      this.w3.setTerrain(this.info, t);
+      this.w3.setTerrain(this.info, t, true);
       this.plantsAt = 0;
     } finally {
       this._terrainBusy = false;
@@ -234,15 +311,21 @@ class App {
     this.last = now;
     const time = now / 1000;
     if (this.info) {
-      if (this.running) {
-        this.renderTick = Math.min(this.tCurr, this.renderTick + dt * this.tps);
-        const buffered = (this.tCurr - this.renderTick) / this.tps;
-        if (buffered < BUFFER_SECONDS && !this.busy) {
-          const ticks = Math.max(1, Math.min(60, Math.round(this.tps * BUFFER_SECONDS)));
-          this.requestFrame(ticks);
-        }
+      // Rebuilding the landscape is costly, so while a stroke is being painted
+      // it happens at most every 0.6 s (painted spots show meanwhile).
+      if (this._terrainDirty && !this._terrainBusy && (!this.painting || now - (this._terrainAt || 0) > 600)) this.reloadTerrain();
+      if (this.running || this.skipping) {
+        // Glide towards the latest state at the speed the simulation is really
+        // going, staying about one frame behind so motion never stalls.
+        const rate = Math.max(this.rate, 0.5);
+        this.renderTick = Math.min(this.tCurr, this.renderTick + dt * rate);
+        if (this.tCurr - this.renderTick > rate * 0.6) this.renderTick = this.tCurr - rate * 0.3;
+        // At top speed fewer frames leave more of the computer's time for simulating.
+        const every = this.skipping ? SKIP_FRAME_MS : this.speed >= 25 ? 2 * FRAME_MS : FRAME_MS;
+        if (!this.busy && now - this.frameAt > every) this.fetchFrame();
       } else {
         this.renderTick = this.tCurr;
+        if (!this.busy && now - this.frameAt > 1000) this.fetchFrame(); // keep the inspector fresh
       }
       this._interpolate();
       this.animals.update(this.rendered, this.info.acts, dt, time);
@@ -269,6 +352,26 @@ class App {
       if (!p || Math.abs(p.x - c.x) + Math.abs(p.y - c.y) > 8) return c;
       return { ...c, x: p.x + (c.x - p.x) * t, y: p.y + (c.y - p.y) * t, h: lerpAngle(p.h, c.h, Math.min(1, t * 1.5)) };
     });
+  }
+
+  // ------------------------------------------------------------------ daily records
+
+  // The ledger only gains a row once a simulated day, so it is fetched again only
+  // when a day has passed (or when asked to).
+  async pullLedger(force = false) {
+    if (this._ledgerBusy || !this.info) return;
+    const tick = this.frame?.tick ?? 0;
+    if (!force && this.ledger && tick - this._ledgerTick < this.info.clock.ticks_per_day) return;
+    this._ledgerBusy = true;
+    try {
+      this.ledger = await api("/api/ledger");
+      this._ledgerTick = tick;
+      this.ui.ledgerUpdated();
+    } catch (err) {
+      this.ui.toast(err.message, "error");
+    } finally {
+      this._ledgerBusy = false;
+    }
   }
 
   // ------------------------------------------------------------------ history
@@ -301,7 +404,7 @@ class App {
   downloadCsv() {
     const h = this.hist;
     if (!h || !h.tick.length) return;
-    const header = ["tick", "plant_biomass"], cols = [h.tick, h.plants];
+    const header = ["tick", "plant_biomass", "voles"], cols = [h.tick, h.plants, h.voles || []];
     for (const sp of this.info.species) {
       const row = h.species[sp.name];
       header.push(`${sp.name}_count`, `${sp.name}_juveniles`, `${sp.name}_vigor`, `${sp.name}_load`, `${sp.name}_marker_he`, `${sp.name}_marker_ho`, `${sp.name}_instinct_agreement`);
@@ -362,6 +465,31 @@ class App {
       new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.6, depthWrite: false, blending: THREE.AdditiveBlending }), 4);
     this.memoryDanger = memoryLayer(new THREE.RingGeometry(0.26, 0.4, 40),
       new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.9, depthWrite: false, side: THREE.DoubleSide }), 5);
+    // What it does that leaves a mark: buried food, its den, scent marks, its territory and its mate.
+    const marker = (geometry, color, count) => {
+      const mesh = new THREE.InstancedMesh(geometry, new THREE.MeshBasicMaterial({ color, depthTest: false, transparent: true }), count);
+      mesh.renderOrder = 7;
+      mesh.count = 0;
+      mesh.frustumCulled = false;
+      mesh.visible = false;
+      this.w3.scene.add(mesh);
+      return mesh;
+    };
+    this.memoryCaches = marker(new THREE.OctahedronGeometry(0.5), 0xffb347, 64);
+    this.memoryLarder = marker(new THREE.OctahedronGeometry(0.6), 0xfff1a8, 64);
+    this.memoryMarks = marker(new THREE.ConeGeometry(0.16, 0.5, 6), 0xffe14d, 32);
+    this.memoryDen = new THREE.Mesh(new THREE.RingGeometry(0.7, 1.0, 32).rotateX(-Math.PI / 2),
+      new THREE.MeshBasicMaterial({ color: 0xff8c42, transparent: true, opacity: 0.95, depthTest: false, side: THREE.DoubleSide }));
+    this.memoryTerritory = new THREE.LineLoop(new THREE.BufferGeometry(),
+      new THREE.LineBasicMaterial({ color: 0xff9f43, transparent: true, opacity: 0.8, depthTest: false }));
+    this.memoryMate = new THREE.Line(new THREE.BufferGeometry(),
+      new THREE.LineBasicMaterial({ color: 0xff7eb6, transparent: true, opacity: 0.9, depthTest: false }));
+    for (const o of [this.memoryDen, this.memoryTerritory, this.memoryMate]) {
+      o.renderOrder = 7;
+      o.frustumCulled = false;
+      o.visible = false;
+      this.w3.scene.add(o);
+    }
     this.trailLine.frustumCulled = this.targetLine.frustumCulled = false;
     this.w3.scene.add(this.trailLine, this.targetLine);
   }
@@ -431,6 +559,7 @@ class App {
     const m = d?.memory;
     const on = !!(this.showMemory && m);
     this.memoryFood.visible = this.memoryDanger.visible = on;
+    this._updateDoings(on ? d : null);
     if (!on || m === this._memShown) return;
     this._memShown = m;
     const W = this.w3.W, H = this.w3.H, size = m.region;
@@ -455,6 +584,51 @@ class App {
     // Danger: red rings, bigger for fresher scares.
     const red = new THREE.Color(0xff3b3b);
     fill(this.memoryDanger, m.danger, 0.2, () => color.copy(red), (v) => 0.5 + 0.5 * v);
+  }
+
+  // Caches, den, scent marks, territory and mate of the selected animal.
+  _updateDoings(d) {
+    const m = d?.memory;
+    const layers = [this.memoryCaches, this.memoryLarder, this.memoryMarks, this.memoryDen, this.memoryTerritory, this.memoryMate];
+    if (!m) {
+      for (const o of layers) o.visible = false;
+      return;
+    }
+    const W = this.w3.W, H = this.w3.H;
+    const ground = (x, y, lift) => new THREE.Vector3(x - W / 2, this.w3.groundY(x, y) + lift, y - H / 2);
+    const mat = new THREE.Matrix4();
+    const bob = 0.15 * Math.sin(performance.now() / 300);
+    const place = (mesh, list, lift) => {
+      let n = 0;
+      for (const [x, y] of list) {
+        if (n >= mesh.instanceMatrix.count) break;
+        mat.makeTranslation(x - W / 2, this.w3.groundY(x, y) + lift + bob, y - H / 2);
+        mesh.setMatrixAt(n++, mat);
+      }
+      mesh.count = n;
+      mesh.visible = n > 0;
+      mesh.instanceMatrix.needsUpdate = true;
+    };
+    const caches = m.caches || [];
+    place(this.memoryCaches, caches.filter((c) => !c[3]), 0.9);
+    place(this.memoryLarder, caches.filter((c) => c[3]), 1.1);
+    place(this.memoryMarks, m.marks || [], 0.35);
+    this.memoryDen.visible = !!m.den;
+    if (m.den) this.memoryDen.position.copy(ground(m.den[0], m.den[1], 0.2));
+    this.memoryTerritory.visible = !!m.territory;
+    if (m.territory) {
+      const [hx, hy, r] = m.territory;
+      const pts = [];
+      for (let k = 0; k < 64; k++) {
+        const a = (k / 64) * Math.PI * 2;
+        const x = Math.min(W - 0.5, Math.max(0.5, hx + Math.cos(a) * r)), y = Math.min(H - 0.5, Math.max(0.5, hy + Math.sin(a) * r));
+        pts.push(ground(x, y, 0.3));
+      }
+      this.memoryTerritory.geometry.setFromPoints(pts);
+    }
+    const self = this.rendered.find((r) => r.id === this.selected);
+    this.memoryMate.visible = !!(m.mate && self);
+    if (m.mate && self) this.memoryMate.geometry.setFromPoints([ground(self.x, self.y, 0.8), ground(m.mate[0], m.mate[1], 0.8)]);
   }
 
   _updateBubbles() {
@@ -547,6 +721,7 @@ class App {
     this.canvas.addEventListener("pointerdown", (e) => {
       down = { x: e.clientX, y: e.clientY, button: e.button };
       if (e.button === 0 && this.tool !== "select" && this.tool !== "spawn") {
+        this.painting = true;
         this._paintAt(e, true);
       }
     });
@@ -561,6 +736,7 @@ class App {
     window.addEventListener("pointerup", (e) => {
       if (down && e.target === this.canvas && down.button === 0 && Math.hypot(e.clientX - down.x, e.clientY - down.y) < 6) this._click(e);
       down = null;
+      this.painting = false; // the stroke is over: the terrain is rebuilt on the next frame
     });
     this.canvas.addEventListener("pointerleave", () => this.w3.showCursor(null));
 
@@ -590,12 +766,18 @@ class App {
     });
     $("#csv").addEventListener("click", () => this.downloadCsv());
     $("#btn-insights").addEventListener("click", () => this.ui.toggleInsights());
+    $("#btn-skip").addEventListener("click", (e) => {
+      e.stopPropagation();
+      this.ui.buildSkipMenu();
+      $("#skip-menu").hidden = !$("#skip-menu").hidden;
+    });
     $("#btn-events").addEventListener("click", (e) => {
       e.stopPropagation();
       $("#events-menu").hidden = !$("#events-menu").hidden;
     });
     document.addEventListener("click", (e) => {
       if (!e.target.closest("#events-menu")) $("#events-menu").hidden = true;
+      if (!e.target.closest("#skip-menu")) $("#skip-menu").hidden = true;
     });
     $("#btn-world").addEventListener("click", () => { $("#world-modal").hidden = false; });
     $("#btn-repop").addEventListener("click", () => this.repopulate());
@@ -641,8 +823,10 @@ class App {
     const body = tool === "fertilise" ? { tool: "fertilise" }
       : tool === "remove" ? { tool: "remove" }
       : { tool: "paint", terrain: tool };
+    if (body.tool === "paint") this.w3.paintMark(p.x, p.y, this.brush, TOOLS.find((t) => t.id === tool)?.color || "#ffffff");
     try {
-      await api("/api/tool", { ...body, x: p.x, y: p.y, radius: this.brush });
+      const r = await api("/api/tool", { ...body, x: p.x, y: p.y, radius: this.brush });
+      if (r.version != null && r.version !== this.w3.version) this._terrainDirty = true;
       if (tool === "fertilise") this.plantsAt = 0;
       if (!this.running) this.requestFrame(0);
     } catch (err) {
@@ -652,7 +836,8 @@ class App {
 
   async showSummary() {
     try {
-      this.ui.showSummary(await api("/api/summary"));
+      const [sum] = await Promise.all([api("/api/summary"), this.ui.refreshAIStatus()]);
+      this.ui.showSummary(sum);
     } catch (err) {
       this.ui.toast(err.message, "error");
     }
@@ -737,6 +922,8 @@ class App {
     try {
       await api("/api/tool", { tool: "repopulate" });
       this.hist = null;
+      this.ledger = null;
+      this.ui.ai.answers = [];
       this.select(null);
       await this.requestFrame(0);
       this.prev = new Map(this.curr.map((a) => [a.id, a]));

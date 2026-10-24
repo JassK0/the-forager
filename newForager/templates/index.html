@@ -34,6 +34,8 @@
     <div class="playback">
       <button id="play" class="round primary" title="Play / pause (Space)">⏸</button>
       <div class="speeds" id="speeds"></div>
+      <button id="btn-skip" class="pill small" title="Skip ahead: simulate days or years as fast as the computer can">⏩</button>
+      <span class="actual-speed" id="actual-speed" hidden></span>
     </div>
     <div class="pops" id="pops"></div>
     <div class="actions">
@@ -64,6 +66,8 @@
   </section>
 
   <div class="menu panel" id="events-menu" hidden></div>
+  <div class="menu panel" id="skip-menu" hidden></div>
+  <div class="skip-panel panel" id="skip-panel" hidden></div>
   <div class="modal-backdrop" id="world-modal" hidden><form class="modal panel" id="world-form"></form></div>
   <div class="modal-backdrop" id="summary-modal" hidden><div class="modal panel summary" id="summary" role="dialog" aria-label="Run summary"></div></div>
   <div class="hint" id="hint"></div>

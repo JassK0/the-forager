@@ -21,6 +21,7 @@ const MODELS = {
       ["nose", [0.06, 0.05, 0.08], [0.54, 0.49, 0], "nose", "head"],
       ["earL", [0.08, 0.36, 0.12], [0.3, 0.84, 0.085], "ears", "earL", [0.3, 0.66, 0.085]],
       ["earR", [0.08, 0.36, 0.12], [0.3, 0.84, -0.085], "ears", "earR", [0.3, 0.66, -0.085]],
+      ["crown", [0.26, 0.11, 0.26], [0.38, 0.73, 0], "#ffd23f", "crown"],
     ],
     neck: [0.24, 0.45, 0],
   },
@@ -44,6 +45,7 @@ const MODELS = {
       ["earL", [0.1, 0.2, 0.11], [0.56, 0.96, 0.11], "ears", "earL", [0.56, 0.86, 0.11]],
       ["earR", [0.1, 0.2, 0.11], [0.56, 0.96, -0.11], "ears", "earR", [0.56, 0.86, -0.11]],
       ["food", [0.26, 0.13, 0.13], [0.98, 0.58, 0], "#b34a3c", "food"],
+      ["crown", [0.28, 0.12, 0.28], [0.6, 0.94, 0], "#ffd23f", "crown"],
     ],
     neck: [0.42, 0.62, 0],
   },
@@ -51,6 +53,7 @@ const MODELS = {
 
 const Y = new THREE.Vector3(0, 1, 0);
 const Z = new THREE.Vector3(0, 0, 1);
+const WINTER_WHITE = new THREE.Color("#f1f3f6");
 const ZERO = new THREE.Matrix4().makeScale(0, 0, 0);
 
 export class Animals {
@@ -100,7 +103,10 @@ export class Animals {
     }
   }
 
-  _slot(group, id, coat) {
+  // Winter-white animals pale through the autumn moult (5 steps) and darken in spring.
+  _slot(group, id, coat, moults = false) {
+    const step = moults ? Math.round((this.moult || 0) * 4) : 0;
+    const key = coat * 8 + step;
     let slot = group.slots.get(id);
     if (slot === undefined) {
       slot = group.free.length ? group.free.pop() : group.slotIds.length;
@@ -110,11 +116,13 @@ export class Animals {
       group.slotCoat = group.slotCoat || [];
       group.slotCoat[slot] = -1;
     }
-    if (group.slotCoat[slot] !== coat) {
-      group.slotCoat[slot] = coat;
+    if (group.slotCoat[slot] !== key) {
+      group.slotCoat[slot] = key;
       const colors = group.coats[coat].colors;
       for (const p of group.parts) {
-        p.mesh.setColorAt(slot, this._c.set(colors[p.color] || (p.color.startsWith("#") ? p.color : colors.body)));
+        this._c.set(colors[p.color] || (p.color.startsWith("#") ? p.color : colors.body));
+        if (step && !["eyes", "nose"].includes(p.color) && !p.color.startsWith("#")) this._c.lerp(WINTER_WHITE, step / 4);
+        p.mesh.setColorAt(slot, this._c);
       }
       for (const p of group.parts) p.mesh.instanceColor.needsUpdate = true;
     }
@@ -143,7 +151,7 @@ export class Animals {
       const targetY = this.w3.groundY(a.x, a.y);
       st.gy += (targetY - st.gy) * Math.min(1, dt * 12);
 
-      const slot = this._slot(group, a.id, a.coat);
+      const slot = this._slot(group, a.id, a.coat, !!(a.flags & 256));
       if (slot < 0) continue;
       counts[a.si] = Math.max(counts[a.si], slot + 1);
       if (act === "hide" || a.flags & 32) {
@@ -234,7 +242,7 @@ export class Animals {
 
     for (const p of group.parts) {
       let local = p.local;
-      if ((p.anim === "stripe" && !coat.stripe) || (p.anim === "food" && !(a.flags & 64))) {
+      if ((p.anim === "stripe" && !coat.stripe) || (p.anim === "food" && !(a.flags & 64)) || (p.anim === "crown" && !(a.flags & 128))) {
         p.mesh.setMatrixAt(slot, ZERO);
         continue;
       }
@@ -255,7 +263,7 @@ export class Animals {
         const splay = (p.anim === "earL" ? 1 : -1) * (isRabbit ? 0.12 : 0.05);
         this._q2.setFromAxisAngle(Z, back).multiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), splay));
         local = this._head.clone().multiply(this._pivoted(p, this._q2));
-      } else if (p.anim === "head" || p.anim === "food") {
+      } else if (p.anim === "head" || p.anim === "food" || p.anim === "crown") {
         local = this._head.clone().multiply(p.local);
       }
       this._m.multiplyMatrices(this._base, local);

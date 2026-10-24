@@ -1,6 +1,7 @@
 // HUD, toolbar, inspector, data drawer and dialogs. All text goes in through
 // textContent (via el()), never innerHTML.
 import { C, alpha, compact, hoverIndex, lineChart, phaseChart, readColors, stackedChart } from "./charts.js";
+import { getJSON, renderMarkdown, streamAI } from "./ai.js";
 
 export const $ = (s) => document.querySelector(s);
 
@@ -66,8 +67,9 @@ export const TOOLS = [
 export class UI {
   constructor(app) {
     this.app = app;
-    this.tab = "populations";
+    this.tab = "ai";
     this.hover = null;
+    this.ai = { status: null, answers: [], seq: 0 }; // the AI analyst's answers this session
     this.chartSel = { species: null, trait: "mass", gene: null };
     this.bubblePool = [];
     this.insightLog = [];
@@ -86,15 +88,77 @@ export class UI {
 
   build(info) {
     this.info = info;
+    this.ai.answers = [];
     this.chartSel.species = info.species[0].name;
     this.chartSel.gene = info.species[0].genes[0].symbol;
     this.buildSpeeds();
+    this.showMode();
     this.buildToolbar();
     this.buildToolOptions();
     this.buildEventsMenu();
     this.buildWorldForm();
     this.buildDrawer();
     this.renderInspector();
+  }
+
+  buildSkipMenu() {
+    const year = this.info.clock.days_per_year;
+    const options = [[1, "1 day"], [year / 4, "1 season"], [year, "1 year"], [5 * year, "5 years"], [10 * year, "10 years"], [25 * year, "25 years"]];
+    $("#skip-menu").replaceChildren(
+      el("div", { class: "menu-head" }, "⏩ Skip ahead"),
+      el("p", { class: "muted small menu-note" }, "Simulates every tick in full, as fast as this computer can, then carries on as before. The results are exactly the same as watching it play. A run that is set to end on an extinction still stops there."),
+      ...options.map(([days, label]) => el("button", { class: "menu-item", onclick: () => this.app.skip(days) },
+        el("strong", {}, label), el("span", {}, `${days} simulated day${days > 1 ? "s" : ""}`))));
+  }
+
+  updateSimClock(c) {
+    const chip = $("#actual-speed");
+    const fmt = (x) => (x >= 10 ? Math.round(x) : x.toFixed(1));
+    if (!c || !c.running || !c.achieved) {
+      chip.hidden = true;
+    } else {
+      chip.hidden = false;
+      const slow = !c.skip && c.speed != null && c.achieved < 0.8 * c.speed;
+      chip.textContent = `${c.skip ? "⏩ " : ""}${fmt(c.achieved)}× now`;
+      chip.classList.toggle("slow", slow);
+      chip.title = slow
+        ? `You asked for ${fmt(c.speed)}×, but with this many animals the computer can simulate about ${fmt(c.achieved)}× real time. Nothing is skipped: every tick is still computed in full.`
+        : "How fast the simulation is actually running (1× = 4 ticks a second)";
+    }
+    const panel = $("#skip-panel");
+    if (!c?.skip) {
+      panel.hidden = true;
+      return;
+    }
+    const tpd = this.info.clock.ticks_per_day, year = tpd * this.info.clock.days_per_year;
+    const { from, to } = c.skip;
+    const done = Math.max(0, Math.min(1, (c.tick - from) / Math.max(1, to - from)));
+    const ticksPerSecond = c.achieved * 4;
+    const left = ticksPerSecond > 0 ? (to - c.tick) / ticksPerSecond : null;
+    const eta = left == null ? "estimating…" : left < 60 ? `about ${Math.max(1, Math.round(left))} s left` : `about ${Math.round(left / 60)} min left`;
+    const day = (t) => Math.floor((t + tpd / 4) / tpd) + 1;
+    const counts = this.app.frame?.counts || [];
+    panel.hidden = false;
+    panel.replaceChildren(
+      el("div", { class: "skip-top" }, el("strong", {}, "⏩ Skipping ahead"),
+        el("span", { class: "muted small" }, `day ${day(c.tick)} of ${day(to)} · year ${Math.floor(c.tick / year) + 1}`),
+        el("button", { class: "pill small", onclick: () => this.app.cancelSkip() }, "Stop")),
+      el("div", { class: "skip-bar" }, el("div", { style: `width:${(done * 100).toFixed(1)}%` })),
+      el("div", { class: "skip-bottom muted small" },
+        el("span", {}, `${Math.round(done * 100)}% · ${fmt(c.achieved)}× real time · ${eta}`),
+        el("span", {}, this.info.species.map((s, i) => `${s.icon} ${counts[i] ?? "–"}`).join("  "))));
+  }
+
+  showMode() {
+    const brand = document.querySelector(".brand");
+    brand.querySelectorAll(".mode").forEach((m) => m.remove());
+    const s = this.info.settings;
+    const cl = this.info.climate;
+    if (cl && cl.name !== "temperate") brand.append(el("span", { class: "mode climate", title: `Climate: ${cl.text}` }, `${cl.icon} ${cl.label}`));
+    if (s.super_animals) {
+      brand.append(el("span", { class: "mode", title: `Super animals mode: evolution runs ${s.evolution_speed}× faster (not realistic)` },
+        `🦸 SUPER ${s.evolution_speed}×`));
+    }
   }
 
   buildSpeeds() {
@@ -210,12 +274,23 @@ export class UI {
         el("label", { class: "field" }, el("span", {}, "Seed"),
           el("span", { class: "seed" }, el("input", { type: "number", name: "seed", value: this.info.seed, min: 0, step: 1 }),
             el("button", { type: "button", class: "pill", onclick: () => { form.seed.value = Math.floor(Math.random() * 1e6); } }, "🎲"))),
+        el("label", { class: "field map-pick" },
+          el("span", {}, "🗺️ Map", el("small", {}, "premade sizes and landscapes; you can still change anything below")),
+          el("select", { name: "map", onchange: (e) => this.applyMapPreset(form, e.target.value) },
+            Object.entries(MAPS).map(([id, m]) => el("option", { value: id, selected: id === this.mapPresetOf(s) }, m.label)))),
+        el("label", { class: "field map-pick" },
+          el("span", {}, "🌍 Climate", el("small", {}, "temperature, snow, dryness and the landscape that goes with them")),
+          el("select", { name: "climate", onchange: (e) => this.applyClimate(form, e.target.value) },
+            Object.entries(this.info.climates).map(([id, c]) => el("option", { value: id, selected: id === (s.climate || "temperate") }, `${c.icon} ${c.label}`))),
+          el("small", { class: "speed-note climate-note" }, this.info.climates[s.climate || "temperate"].text)),
+        num("width", "Width (cells)", s.width ?? 160, 40, 240, 1),
+        num("height", "Height (cells)", s.height ?? 100, 30, 160, 1),
         num("water_fraction", "Water (%)", s.water_fraction * 100, 3, 50, 1),
         num("forest_fraction", "Forest (%)", s.forest_fraction * 100, 0, 50, 1),
         num("rock_fraction", "Mountains (%)", s.rock_fraction * 100, 0, 30, 1),
         num("plant_growth", "Plant growth rate", s.plant_growth, 0.0005, 0.05, 0.0005, "logistic r"),
         num("mutation", "Mutation rate", s.mutation, 0, 20, 0.5, "× default"),
-        num("immigration", "Immigration", s.immigration, 0, 0.01, 0.0005, "per species per tick"),
+        num("immigration", "Immigration", s.immigration, 0, 0.01, 0.0001, "per species per tick"),
         ...this.info.species.map((sp) => num(`initial.${sp.name}`, `${sp.icon} Starting ${plural(sp.name).toLowerCase()}`, s.initial[sp.name], 0, 2000, 1)),
         el("label", { class: "field" }, el("span", {}, "🧠 Decision-making", el("small", {}, "how animals choose what to do")),
           el("select", { name: "brains" },
@@ -223,6 +298,19 @@ export class UI {
             el("option", { value: "rules", selected: s.brains === "rules" }, "Fixed instincts (rules)"))),
         el("label", { class: "field check" }, el("input", { type: "checkbox", name: "learning", checked: s.learning !== false }), el("span", {}, "🎓 Animals learn from experience during their lives (with neural networks)")),
         el("label", { class: "field check" }, el("input", { type: "checkbox", name: "seasons", checked: s.seasons }), el("span", {}, "Seasons (winter, breeding seasons)")),
+        el("label", { class: "field check" }, el("input", { type: "checkbox", name: "emigration", checked: s.emigration !== false }),
+          el("span", {}, "🚪 Emigration: foxes that can't find a territory eventually leave the area. Off: they stay as floaters and keep trying (a closed population).")),
+        el("label", { class: "field check" }, el("input", {
+          type: "checkbox", name: "super_animals", checked: !!s.super_animals,
+          onchange: (e) => { form.querySelector(".super-speed").hidden = !e.target.checked; },
+        }), el("span", {}, "🦸 Super animals (just for fun, not realistic): much faster evolution, traits with no natural ceiling and quicker learners. The strongest get a 👑.")),
+        el("div", { class: "super-speed", hidden: !s.super_animals },
+          this.superSlider("evolution_speed", "🧬 Evolution speed", s.evolution_speed ?? 6, 1, 20, 0.5, (v) => this.superSpeedNote(v)),
+          this.superSlider("learning_speed", "🧠 Brain learning speed", s.learning_speed ?? 2, 1, 10, 0.5,
+            (v) => `${v}×: brains rewire ${v}× as fast from rewards and punishments`),
+          this.superSlider("inherit_learning", "🎓 Know-how passed to young", Math.round(100 * (s.inherit_learning ?? 0.5)), 0, 80, 5,
+            (v) => (v ? `${v}%: young start life with ${v}% of their parents' learned brain wiring, hunting skill and wariness, so know-how builds up over generations`
+              : "0%: every animal starts from its genes alone, as in real life"))),
         el("label", { class: "field check" }, el("input", { type: "checkbox", name: "end_on_extinction", checked: s.end_on_extinction }), el("span", {}, "🏁 End the run (with a summary) when a species dies out"))),
       el("div", { class: "modal-actions" },
         el("button", { type: "button", class: "pill", onclick: () => { $("#world-modal").hidden = true; } }, "Cancel"),
@@ -241,11 +329,70 @@ export class UI {
         end_on_extinction: d.get("end_on_extinction") === "on",
         brains: d.get("brains"),
         learning: d.get("learning") === "on",
+        super_animals: d.get("super_animals") === "on",
+        evolution_speed: +d.get("evolution_speed"),
+        learning_speed: +d.get("learning_speed"),
+        inherit_learning: +d.get("inherit_learning") / 100,
+        width: +d.get("width"),
+        height: +d.get("height"),
+        emigration: d.get("emigration") === "on",
+        climate: d.get("climate"),
         initial: Object.fromEntries(this.info.species.map((sp) => [sp.name, +d.get(`initial.${sp.name}`)])),
       };
       $("#world-modal").hidden = true;
       this.app.newWorld(+d.get("seed"), settings);
     };
+  }
+
+  // What an evolution speed does (mirrors super_spread in engine/config.py).
+  superSpeedNote(speed) {
+    const spread = Math.min(2, 1 + 0.1 * (speed - 1));
+    return `${speed}×: mutations ${speed}× as often and ${spread.toFixed(2)}× the variation between parents and young`;
+  }
+
+  superSlider(name, label, value, min, max, step, note) {
+    const out = el("small", { class: "speed-note" }, note(+value));
+    return el("label", { class: "field super-slider" }, el("span", {}, label),
+      el("input", { type: "range", name, min, max, step, value, oninput: (e) => { out.textContent = note(+e.target.value); } }), out);
+  }
+
+  // A climate brings its own typical landscape, and starting numbers scaled to
+  // how much food the land can grow there (on this map's area).
+  applyClimate(form, id) {
+    const c = this.info.climates[id];
+    if (!c) return;
+    form.water_fraction.value = c.terrain.water;
+    form.forest_fraction.value = c.terrain.forest;
+    form.rock_fraction.value = c.terrain.rock;
+    const area = (+form.width.value * +form.height.value) / (160 * 100);
+    const set = (name, n) => { const input = form.querySelector(`[name="initial.${name}"]`); if (input) input.value = n; };
+    set("rabbit", Math.max(8, Math.round(160 * area * c.animals)));
+    set("fox", Math.max(2, Math.round(14 * area * c.animals)));
+    form.querySelector(".climate-note").textContent = c.text;
+  }
+
+  // Which premade map the current settings match ("custom" if none).
+  mapPresetOf(s) {
+    const hit = Object.entries(MAPS).find(([id, m]) => id !== "custom" && m.width === s.width && m.height === s.height
+      && Math.abs(m.water - s.water_fraction * 100) < 0.5 && Math.abs(m.forest - s.forest_fraction * 100) < 0.5
+      && Math.abs(m.rock - s.rock_fraction * 100) < 0.5);
+    return hit ? hit[0] : "custom";
+  }
+
+  applyMapPreset(form, id) {
+    const m = MAPS[id];
+    if (!m || id === "custom") return;
+    form.width.value = m.width;
+    form.height.value = m.height;
+    form.water_fraction.value = m.water;
+    form.forest_fraction.value = m.forest;
+    form.rock_fraction.value = m.rock;
+    form.immigration.value = m.immigration;
+    if (m.keepGoing) form.end_on_extinction.checked = false;
+    for (const [name, n] of Object.entries(m.initial)) {
+      const input = form.querySelector(`[name="initial.${name}"]`);
+      if (input) input.value = n;
+    }
   }
 
   // ------------------------------------------------------------------ inspector
@@ -284,9 +431,19 @@ export class UI {
       d.pregnant ? el("span", { class: "badge pink" }, `🤰 due in ${this.hoursOf(d.gestation_left)}`) : null,
       d.litter ? el("span", { class: "badge pink" }, `🪺 ${d.litter} young · next feed in ${this.hoursOf(d.next_nurse || 0)}`) : null,
       d.fear > 0.3 ? el("span", { class: "badge soft" }, "😰 nervous after a scare") : null,
-      d.caches ? el("span", { class: "badge soft" }, `🦴 ${d.caches} food cache${d.caches > 1 ? "s" : ""}`) : null);
+      d.alpha ? el("span", { class: "badge gold", title: "One of the three strongest of its species alive (Super animals mode)" },
+        `👑 alpha #${d.alpha}${d.power ? ` · ${d.power}× founders' prowess` : ""}`) : null,
+      d.injury > 0.05 ? el("span", { class: "badge pink", title: "Injured: slower, a worse hunter and a less attractive mate until it heals" },
+        `🩹 injured ${Math.round(d.injury * 100)}%${d.lame ? " · permanent limp" : ""}`) : null,
+      d.sight != null && d.sight < 1 && !d.adult ? el("span", { class: "badge soft" }, d.sight === 0 ? "🙈 eyes still closed" : `👀 eyes opening (${Math.round(d.sight * 100)}%)`) : null,
+      d.caches ? el("span", { class: "badge soft" }, `🦴 ${d.caches} food cache${d.caches > 1 ? "s" : ""}`) : null,
+      d.winter_white ? el("span", { class: "badge soft", title: "Carries the winter-white gene: moults to a white coat for winter, timed by day length" },
+        "❄️ turns white in winter") : null);
+    const place = d.place ? this.placeLine(d.place) : null;
     const bars = el("div", { class: "bars" },
-      this.meter("Energy", d.energy, "#f5a524"), this.meter("Water", d.water, "#3f97dc"), this.meter("Stamina", d.stamina, "#7bc950"));
+      this.meter("Energy", d.energy, "#f5a524"), this.meter("Water", d.water, "#3f97dc"), this.meter("Stamina", d.stamina, "#7bc950"),
+      d.urge > 0.02 ? this.meter("Urge to mate", d.urge, "#e85d9a") : null);
+    if (place) bars.append(place);
     const facts = el("div", { class: "facts" },
       this.fact("Age", `${this.days(d.age)}`), this.fact("Life expectancy", this.days(d.lifespan)),
       this.fact("Generation", d.generation), this.fact("Mass", `${d.mass} kg`));
@@ -310,6 +467,17 @@ export class UI {
 
   hoursOf(ticks) {
     return this.days(ticks);
+  }
+
+  // Where the animal is living, and how well its coat hides it there.
+  placeLine(p) {
+    const t = p.temperature;
+    const feel = t < -1.2 ? "bitterly cold" : t < -0.5 ? "freezing" : t < 0 ? "cold" : t < 0.6 ? "mild" : t < 1.1 ? "warm" : "scorching";
+    const gap = p.camouflage ?? Math.abs(p.coat - p.ground);
+    const camo = gap < 0.12 ? "well hidden" : gap < 0.28 ? "partly hidden" : "stands out";
+    const snow = p.snow > 0.6 ? " · deep snow" : p.snow > 0.15 ? " · some snow" : "";
+    return el("div", { class: "place muted small", title: `Coat lightness ${p.coat} against ground ${p.ground} (0 black, 1 white); colour difference as a fox or rabbit sees it: ${gap} (0 = perfect match). Camouflage works while it keeps still.` },
+      `📍 ${title(p.biome)} · ${feel}${snow} · coat ${camo} against the ground`);
   }
 
   meter(label, v, color) {
@@ -489,7 +657,7 @@ export class UI {
       const hunter = m.skill != null;
       out.push(el("div", { class: "section-label" }, "🧭 Memory & experience"),
         el("div", { class: "bars" },
-          this.meter("Wariness", m.experience, "#8a6fdf"),
+          hunter ? null : this.meter("Wariness", m.experience, "#8a6fdf"),
           hunter ? this.meter("Hunt skill", m.skill, "#eb6834") : null),
         el("div", { class: "facts" },
           this.fact(hunter ? "Hunting grounds" : "Feeding spots", `${m.food.filter((f) => f[2] >= 0.2).length} remembered`),
@@ -500,7 +668,13 @@ export class UI {
           this.app.showMemory ? "🗺️ Hide memory map" : "🗺️ Show memory on map"),
         this.app.showMemory ? el("div", { class: "legend" },
           el("span", {}, el("i", { style: "background:#3fd16b" }), hunter ? "remembered hunting ground" : "remembered good grazing"),
-          el("span", {}, el("i", { style: "background:transparent;border:2px solid #ff3b3b;border-radius:50%" }), "remembered danger")) : null,
+          el("span", {}, el("i", { style: "background:transparent;border:2px solid #ff3b3b;border-radius:50%" }), "remembered danger"),
+          m.caches?.length ? el("span", {}, el("i", { style: "background:#ffb347;transform:rotate(45deg)" }), `buried food (${m.caches.length})`) : null,
+          m.caches?.some((c) => c[3]) ? el("span", {}, el("i", { style: "background:#fff1a8;transform:rotate(45deg)" }), "food carried home for the young") : null,
+          m.den ? el("span", {}, el("i", { style: "background:transparent;border:2px solid #ff8c42;border-radius:50%" }), "den with young") : null,
+          m.territory ? el("span", {}, el("i", { style: "background:transparent;border:2px solid #ff9f43;border-radius:50%" }), "territory core") : null,
+          m.marks?.length ? el("span", {}, el("i", { style: "background:#ffe14d" }), `scent marks (${m.marks.length})`) : null,
+          m.mate ? el("span", {}, el("i", { style: "background:#ff7eb6;height:3px" }), "line to its mate") : null) : null,
         el("p", { class: "muted small" }, "Wariness grows with every predator it spots and every escape; it sharpens how fast it notices danger. Memories of places fade over a day or two. Young animals inherit their mother's map of good food at weaning."));
     }
     return out;
@@ -757,6 +931,9 @@ export class UI {
   insightCard(item, { popup = false, onClose } = {}) {
     const sp = this.info.species.find((s) => s.name === item.species);
     const actions = el("div", { class: "card-actions" },
+      item.icon === "💀" && item.species ? el("button", {
+        class: "pill small accent", onclick: () => { onClose?.(); this.askAI({ kind: "extinction", species: item.species }); },
+      }, "🤖 Ask AI why") : null,
       item.chart ? el("button", { class: "pill small", onclick: () => this.openChart(item.chart) }, "📈 Show chart") : null,
       popup ? el("button", { class: "pill small", onclick: () => { onClose?.(); this.toggleInsights(true); } }, "All explanations") : null);
     return el("article", { class: `card ${item.level}` },
@@ -888,7 +1065,7 @@ export class UI {
           el("div", { class: "muted small" }, `${sum.days} days · ${sum.years} simulated years · seed ${sum.seed}`)),
         el("button", { class: "round small", "aria-label": "Close", onclick: closeModal }, "✕")),
       el("div", { class: "sum-body" },
-        el("section", { class: "sum-story" }, sum.story.map((p) => el("p", {}, p))),
+        this.summaryStory(sum),
         el("figure", { class: "chart sum-figure" },
           el("figcaption", {}, el("span", {}, "Populations over the whole run"),
             el("span", { class: "legend" }, info.species.map((sp, i) => el("span", {}, el("i", { style: `background:${[C["series-1"], C["series-2"]][i] || C["series-1"]}` }), plural(sp.name))))),
@@ -918,6 +1095,24 @@ export class UI {
     });
   }
 
+  // The summary's story: written by the AI analyst when a key is set up, otherwise
+  // the built-in notes with a pointer to the setup.
+  summaryStory(sum) {
+    const auto = sum.story.map((p) => el("p", {}, p));
+    const st = this.ai.status;
+    if (!st?.configured) {
+      return el("section", { class: "sum-story" }, auto,
+        el("div", { class: "ai-callout" }, "🔑 Want to know exactly why? Paste a Claude API key into ",
+          el("code", {}, st?.env_file || "newForager/.env"),
+          " and open this summary again: the AI analyst reads the run's records and map and proves why things happened."));
+    }
+    const answer = this.askAI({ kind: "summary" }, { open: false });
+    return el("section", { class: "sum-story ai" },
+      el("div", { class: "sum-ai-label" }, "🤖 What happened, and why · written by Claude from this run's records"),
+      this.answerView(answer, { modal: true }),
+      el("details", { class: "sum-auto" }, el("summary", {}, "Built-in notes (no AI)"), auto));
+  }
+
   openChart(chart) {
     if (!chart) return;
     this.tab = chart.tab;
@@ -932,14 +1127,17 @@ export class UI {
   // ------------------------------------------------------------------ data drawer
 
   buildDrawer() {
-    const tabs = [["populations", "🐾 Populations"], ["traits", "📏 Traits"], ["genes", "🧬 Alleles"], ["diversity", "🌈 Diversity"], ["brains", "🧠 Brains"]];
+    const tabs = [["ai", "🤖 AI analyst"], ["populations", "🐾 Populations"], ["deaths", "💀 Deaths & births"], ["traits", "📏 Traits"],
+      ["genes", "🧬 Alleles"], ["diversity", "🌈 Diversity"], ["brains", "🧠 Brains"]];
+    $("#drawer").classList.toggle("tall", this.tab === "ai");
+    document.body.classList.toggle("drawer-tall", this.tab === "ai");
     $("#tabs").replaceChildren(...tabs.map(([id, label]) =>
       el("button", { class: this.tab === id ? "on" : "", onclick: () => { this.tab = id; this.buildDrawer(); } }, label)));
     const controls = $("#drawer-controls");
     controls.replaceChildren();
     const sel = this.chartSel;
     const sp = this.info.species.find((s) => s.name === sel.species) || this.info.species[0];
-    if (this.tab !== "populations") {
+    if (this.tab !== "populations" && this.tab !== "ai") {
       controls.append(el("select", {
         "aria-label": "Species", onchange: (e) => {
           sel.species = e.target.value;
@@ -966,10 +1164,34 @@ export class UI {
       el("canvas", { id, role: "img", "aria-label": caption }));
     const s1 = C["series-1"], s2 = C["series-2"], s3 = C["series-3"], s4 = C["series-4"];
     const spColor = (name) => [s1, s2][this.info.species.findIndex((s) => s.name === name)] || s1;
+    if (this.tab === "ai") {
+      body.replaceChildren(this.aiPanel());
+      this.updateAIActions();
+      this.updateAIAnswers();
+      this.app.pullLedger(true);
+      this.refreshAIStatus().then(() => this.updateAIActions());
+      return;
+    }
+    if (this.tab === "deaths") {
+      const causes = this.deathCauses(sp.name);
+      this._causeKey = causes.map((c) => c.key).join();
+      const meat = sp.diet !== "plants";
+      body.replaceChildren(el("div", { class: "grid4" },
+        chart("c-bd", `${sp.icon} Born and died, per day`, [[s1, "born"], [s2, "died"]]),
+        chart("c-causes", `${sp.icon} What killed them (share of each day's deaths)`, causes.map((c, i) => [[s1, s2, s3, s4][i], c.label])),
+        chart("c-adults", `${sp.icon} Adults old enough to breed`, [[s1, "females"], [s2, "males"]]),
+        chart("c-food", meat ? `${sp.icon} Food per ${sp.name} (rabbits, plus voles counted as rabbits)` : `${sp.icon} Food: plant cover (share of capacity)`)),
+      el("p", { class: "muted small note" }, "Recorded once a day. Numbers fall while the orange line is above the blue one. Check what killed them, and whether both sexes are left to breed: a population with no adult females can't recover however much food there is."));
+      body.querySelectorAll("canvas").forEach((c) => this.hoverable(c));
+      this.app.pullLedger(true);
+      this.drawCharts();
+      return;
+    }
     if (this.tab === "populations") {
       body.replaceChildren(el("div", { class: "grid4" },
         ...this.info.species.map((s) => chart(`c-${s.name}`, `${s.icon} ${plural(s.name)}`)),
         chart("c-plants", "🌿 Plant biomass"),
+        chart("c-voles", "🐭 Voles (estimated, foxes' staple prey)"),
         chart("c-phase", `Phase plane: ${plural(this.info.species[1]?.name || "").toLowerCase()} vs ${plural(this.info.species[0].name).toLowerCase()}`)));
     } else if (this.tab === "traits") {
       const t = sp.traits[sel.trait];
@@ -1011,8 +1233,13 @@ export class UI {
   }
 
   drawCharts() {
+    if ($("#drawer").hidden || this.tab === "ai") return;
+    if (this.tab === "deaths") {
+      this.drawDeathCharts();
+      return;
+    }
     const h = this.app.hist;
-    if (!h || $("#drawer").hidden) return;
+    if (!h) return;
     const s1 = C["series-1"], s2 = C["series-2"], s3 = C["series-3"], s4 = C["series-4"];
     const xs = h.tick, hover = this.hover;
     const info = this.info;
@@ -1022,6 +1249,7 @@ export class UI {
     if (this.tab === "populations") {
       info.species.forEach((s) => lineChart(q(`c-${s.name}`), { xs, series: [{ ys: h.species[s.name].count, color: spColor(s.name) }], hover }));
       lineChart(q("c-plants"), { xs, series: [{ ys: h.plants, color: s3 }], hover });
+      lineChart(q("c-voles"), { xs, series: [{ ys: h.voles || [], color: s4 }], hover, emptyText: "No vole data yet" });
       if (info.species.length > 1) {
         phaseChart(q("c-phase"), {
           xs: h.species[info.species[0].name].count, ys: h.species[info.species[1].name].count,
@@ -1092,8 +1320,8 @@ export class UI {
 
   hoverable(canvas) {
     const move = (e) => {
-      const h = this.app.hist;
-      if (!h) return;
+      const xs = this.tab === "deaths" ? this.app.ledger?.tick : this.app.hist?.tick;
+      if (!xs) return;
       if (canvas._phase) {
         const r = canvas.getBoundingClientRect();
         const p = canvas._phase;
@@ -1107,7 +1335,7 @@ export class UI {
         const g = canvas._geo;
         const r = canvas.getBoundingClientRect();
         const fx = Math.max(0, Math.min(1, (e.clientX - r.left - g.pad.l) / g.pw));
-        this.hover = hoverIndex(h.tick, g.x0 + fx * (g.x1 - g.x0));
+        this.hover = hoverIndex(xs, g.x0 + fx * (g.x1 - g.x0));
       }
       this.drawCharts();
       this.chartTip(e.clientX, e.clientY);
@@ -1121,6 +1349,10 @@ export class UI {
   }
 
   chartTip(cx, cy) {
+    if (this.tab === "deaths") {
+      this.deathTip(cx, cy);
+      return;
+    }
     const h = this.app.hist, i = this.hover, tip = $("#chart-tip");
     if (i == null || !h) { tip.hidden = true; return; }
     const tpd = this.info.clock.ticks_per_day;
@@ -1131,6 +1363,7 @@ export class UI {
     if (this.tab === "populations") {
       this.info.species.forEach((s, k) => rows.push(row([s1, s2][k], compact(h.species[s.name].count[i]), plural(s.name).toLowerCase())));
       rows.push(row(s3, compact(h.plants[i]), "plant biomass"));
+      if (h.voles) rows.push(row(s4, compact(h.voles[i]), "voles"));
     } else if (this.tab === "traits") {
       const t = h.species[sel.species].traits[sel.trait];
       rows.push(row(s1, t.mean[i] == null ? "–" : `${compact(t.mean[i])} ± ${compact(t.sd[i])}`, "phenotype"));
@@ -1156,10 +1389,308 @@ export class UI {
       rows.push(row(s1, compact(r.diversity.he[i]), "expected He"), row(s2, compact(r.diversity.ho[i]), "observed Ho"),
         row(s3, compact(r.vigor[i]), "vigour"), row(s4, compact(r.load[i]), "deleterious alleles"));
     }
+    this.placeTip(rows, cx, cy);
+  }
+
+  placeTip(rows, cx, cy) {
+    const tip = $("#chart-tip");
     tip.replaceChildren(...rows);
     tip.hidden = false;
     const w = tip.offsetWidth, hh = tip.offsetHeight;
     tip.style.left = `${Math.min(innerWidth - w - 8, cx + 14)}px`;
     tip.style.top = `${Math.max(8, cy - hh - 12)}px`;
   }
+
+  // ------------------------------------------------------------------ Deaths & births
+
+  // The species' main causes of death over the run (at most four bands; the rest go in "other").
+  deathCauses(name) {
+    const L = this.app.ledger, s = L?.species[name];
+    if (!s) return [];
+    const totals = L.causes.map((c) => [c, s.causes[c].reduce((a, b) => a + b, 0)]).filter(([, n]) => n > 0).sort((a, b) => b[1] - a[1]);
+    const many = totals.length > 4;
+    const out = totals.slice(0, many ? 3 : 4).map(([c]) => ({ key: c, label: CAUSE_LABEL[c] || c }));
+    if (many) out.push({ key: "other", label: "other", others: totals.slice(3).map(([c]) => c) });
+    return out;
+  }
+
+  causeSeries(s, c) {
+    return c.key === "other" ? s.deaths.map((_, i) => c.others.reduce((a, o) => a + s.causes[o][i], 0)) : s.causes[c.key];
+  }
+
+  drawDeathCharts() {
+    const L = this.app.ledger, sel = this.chartSel;
+    const s = L?.species[sel.species];
+    const q = (id) => document.getElementById(id);
+    const s1 = C["series-1"], s2 = C["series-2"], s3 = C["series-3"], s4 = C["series-4"];
+    const xs = L?.tick || [], hover = this.hover;
+    const sp = this.info.species.find((x) => x.name === sel.species);
+    const color = [s1, s2][this.info.species.indexOf(sp)] || s1;
+    const none = { ys: [], color: s1 };
+    lineChart(q("c-bd"), { xs, hover, series: s ? [{ ys: s.births, color: s1 }, { ys: s.deaths, color: s2 }] : [none] });
+    const layers = s ? this.deathCauses(sel.species).map((c, k) => {
+      const ys = this.causeSeries(s, c);
+      return { color: [s1, s2, s3, s4][k], ys: s.deaths.map((tot, i) => (tot > 0 ? ys[i] / tot : null)) };
+    }) : [];
+    stackedChart(q("c-causes"), { xs: layers.length ? xs : [], layers, hover });
+    lineChart(q("c-adults"), { xs, hover, series: s ? [{ ys: s.af, color: s1 }, { ys: s.am, color: s2 }] : [none] });
+    lineChart(q("c-food"), {
+      xs, hover, zero: true, yFormat: sp?.diet === "plants" ? (v) => `${Math.round(v * 100)}%` : undefined,
+      series: [{ ys: s ? s.food : [], color }], emptyText: "None left to feed",
+    });
+  }
+
+  deathTip(cx, cy) {
+    const L = this.app.ledger, i = this.hover, sel = this.chartSel;
+    const s = L?.species[sel.species];
+    if (i == null || !s || i >= L.tick.length) { $("#chart-tip").hidden = true; return; }
+    const s1 = C["series-1"], s2 = C["series-2"], s3 = C["series-3"], s4 = C["series-4"];
+    const row = (color, value, label) => el("div", { class: "row" }, el("i", { style: `background:${color}` }), el("strong", {}, value), el("span", {}, label));
+    const sp = this.info.species.find((x) => x.name === sel.species);
+    const rows = [el("div", { class: "when" }, `Day ${L.day[i]} · ${s.n[i]} ${plural(sp.name).toLowerCase()}`),
+      row(s1, compact(s.births[i]), "born"), row(s2, compact(s.deaths[i]), "died")];
+    this.deathCauses(sel.species).forEach((c, k) => rows.push(row([s1, s2, s3, s4][k], compact(this.causeSeries(s, c)[i]), `of ${c.label}`)));
+    rows.push(row(s1, String(s.af[i]), "adult females"), row(s2, String(s.am[i]), "adult males"));
+    if (s.territories[i] != null) rows.push(row(C["ink-2"], `${s.territories[i]} (${s.paired[i]})`, "territories (pairs)"), row(C["ink-2"], String(s.floaters[i]), "floaters"));
+    const food = s.food[i];
+    rows.push(row(C["ink-2"], food == null ? "–" : sp.diet === "plants" ? `${Math.round(food * 100)}%` : compact(food),
+      sp.diet === "plants" ? "plant cover" : `food per ${sp.name}`));
+    this.placeTip(rows, cx, cy);
+  }
+
+  ledgerUpdated() {
+    if ($("#drawer").hidden) return;
+    if (this.tab === "ai") {
+      document.getElementById("ai-glance")?.replaceChildren(...[this.glanceView()].flat());
+    } else if (this.tab === "deaths") {
+      if (this.deathCauses(this.chartSel.species).map((c) => c.key).join() !== this._causeKey) this.buildDrawer();
+      else this.drawCharts();
+    }
+  }
+
+  // ------------------------------------------------------------------ AI analyst
+
+  async refreshAIStatus() {
+    try {
+      this.ai.status = await getJSON("/api/ai/status");
+    } catch {
+      // keep the last known status
+    }
+    return this.ai.status;
+  }
+
+  dayLabel(tick) {
+    const tpd = this.info.clock.ticks_per_day;
+    return `Day ${Math.floor((tick + tpd / 4) / tpd) + 1}`;
+  }
+
+  aiTitle(req) {
+    if (req.kind === "summary") return "📜 Run summary";
+    if (req.kind === "extinction") return `💀 Why did the ${plural(req.species).toLowerCase()} die out?`;
+    return `💬 ${req.question}`;
+  }
+
+  // Ask the analyst. The same question at the same moment is answered once.
+  askAI(req, { open = true } = {}) {
+    const tick = this.app.frame?.tick;
+    const same = this.ai.answers.find((a) => a.kind === req.kind && (a.species || null) === (req.species || null)
+      && (a.question || "") === (req.question || "") && a.tick === tick && !a.error);
+    if (same) {
+      if (open) this.openAITab();
+      return same;
+    }
+    const answer = { id: ++this.ai.seq, ...req, tick, title: this.aiTitle(req), text: "", meta: null, error: null, done: false, info: null, views: new Set() };
+    this.ai.answers.unshift(answer);
+    if (open) this.openAITab();
+    streamAI(req, (ev) => {
+      if (ev.meta) answer.meta = ev.meta;
+      if (ev.text) answer.text += ev.text;
+      if (ev.error) answer.error = ev.error;
+      if (ev.done) answer.info = ev;
+      this.paintAnswer(answer);
+    }).catch((err) => {
+      answer.error = err.message;
+    }).finally(() => {
+      if (!answer.text && !answer.error) answer.error = "The answer stopped before it began. Try again.";
+      answer.done = true;
+      this.paintAnswer(answer);
+    });
+    return answer;
+  }
+
+  openAITab() {
+    if (this.tab === "ai" && !$("#drawer").hidden) {
+      this.updateAIAnswers();
+      return;
+    }
+    this.tab = "ai";
+    $("#drawer").hidden = false;
+    document.body.classList.add("drawer-open");
+    this.buildDrawer();
+  }
+
+  paintAnswer(answer) {
+    if (answer._raf) return;
+    answer._raf = requestAnimationFrame(() => {
+      answer._raf = 0;
+      for (const v of answer.views) {
+        if (v.isConnected) this.fillAnswer(v, answer);
+        else answer.views.delete(v);
+      }
+    });
+  }
+
+  answerView(answer, { modal = false } = {}) {
+    const v = el("article", { class: `ai-answer${modal ? " in-modal" : ""}` });
+    v._modal = modal;
+    answer.views.add(v);
+    this.fillAnswer(v, answer);
+    return v;
+  }
+
+  fillAnswer(v, a) {
+    if (!v._parts) {
+      v._parts = { head: el("header", {}), body: el("div", { class: "md" }), foot: el("footer", { class: "ai-foot" }) };
+      v.append(...(v._modal ? [] : [v._parts.head]), v._parts.body, v._parts.foot);
+    }
+    const { head, body, foot } = v._parts;
+    if (!v._modal) head.replaceChildren(el("strong", {}, a.title), a.tick != null ? el("span", { class: "muted small" }, this.dayLabel(a.tick)) : null);
+    const kids = [];
+    if (a.text) kids.push(renderMarkdown(a.text));
+    if (a.error) kids.push(el("p", { class: "ai-error" }, `⚠️ ${a.error}`));
+    if (!a.text && !a.error) kids.push(el("p", { class: "ai-wait" }, "🤖 Claude is reading this run's records and map…"));
+    body.replaceChildren(...kids);
+    v.classList.toggle("streaming", !a.done);
+    if (a.meta && foot._for !== a.meta.evidence) {
+      foot._for = a.meta.evidence;
+      const m = a.meta;
+      const gone = m.extinctions.length ? `, ${m.extinctions.length} extinction${m.extinctions.length > 1 ? "s" : ""}` : "";
+      foot.replaceChildren(
+        el("span", {}, `Based on ${m.days} days of daily records, the last ${m.deaths_logged} deaths${gone}, your sandbox actions and the map.`),
+        el("a", { href: `/api/ai/evidence/${m.evidence}.txt`, target: "_blank", rel: "noopener" }, "📄 See the evidence"),
+        el("details", { class: "ai-map" }, el("summary", {}, "🗺️ The map it looked at"),
+          el("img", { src: `/api/ai/evidence/${m.evidence}.png`, alt: "Top-down map of the world given to the AI: terrain, animals, territories and recent deaths", loading: "lazy" })),
+        el("span", { class: "ai-usage" }));
+    }
+    const usage = foot.querySelector(".ai-usage");
+    if (usage && a.done && a.info) {
+      const i = a.info;
+      usage.textContent = i.cached ? "Saved answer: no new cost."
+        : `${i.model || ""}${i.input_tokens ? ` · ${i.input_tokens.toLocaleString()} tokens read, ${(i.output_tokens || 0).toLocaleString()} written` : ""}${i.stop_reason === "max_tokens" ? " · cut short at the length limit" : ""}`;
+    }
+  }
+
+  aiPanel() {
+    return el("div", { class: "ai-panel" },
+      el("div", { class: "ai-side" },
+        el("div", { class: "section-label" }, "At a glance (last 3 days)"),
+        el("div", { class: "glance", id: "ai-glance" }, this.glanceView()),
+        el("div", { class: "section-label" }, "🤖 Ask the AI analyst"),
+        el("div", { class: "ai-actions", id: "ai-actions" })),
+      el("div", { class: "ai-answers", id: "ai-answers" }));
+  }
+
+  // Plain numbers anyone can read, straight from the daily records (no AI needed).
+  glanceView() {
+    const L = this.app.ledger;
+    if (!L || L.tick.length < 1) return el("p", { class: "muted small" }, "Collecting the first day of records…");
+    const n = L.tick.length, last = n - 1, from = Math.max(0, n - 3);
+    const sum = (a) => a.slice(from).reduce((x, y) => x + (y || 0), 0);
+    return this.info.species.map((sp) => {
+      const s = L.species[sp.name];
+      const now = s.n[last], before = s.n[Math.max(0, n - 4)];
+      const born = sum(s.births), died = sum(s.deaths);
+      const top = L.causes.map((c) => [c, sum(s.causes[c])]).sort((a, b) => b[1] - a[1])[0];
+      const cause = died > 0 && top[1] > 0 ? `, mostly ${CAUSE_LABEL[top[0]] || top[0]} (${Math.round((100 * top[1]) / died)}%)` : "";
+      const change = before ? (now - before) / before : null;
+      const warn = [];
+      if (now === 0) warn.push("💀 None left");
+      else {
+        if (s.af[last] === 0) warn.push("⚠️ No adult females: they can't breed");
+        if (s.am[last] === 0) warn.push("⚠️ No adult males: they can't breed");
+        if (now <= 4) warn.push("⚠️ Close to dying out");
+      }
+      const terr = s.territories[last] != null ? ` · ${s.territories[last]} territories (${s.paired[last]} pairs), ${s.floaters[last]} floaters` : "";
+      return el("div", { class: "glance-row" },
+        el("div", { class: "glance-top" }, el("strong", {}, `${sp.icon} ${plural(sp.name)}`), el("span", { class: "big" }, now.toLocaleString()),
+          change != null && Math.round(change * 100) !== 0 ? el("span", { class: change < 0 ? "down" : "up" }, `${change < 0 ? "▼" : "▲"} ${Math.abs(Math.round(change * 100))}%`) : null),
+        el("div", { class: "muted small" }, `Adults: ${s.af[last]} ♀ · ${s.am[last]} ♂${terr}`),
+        el("div", { class: "muted small" }, `${Math.round(born).toLocaleString()} born, ${Math.round(died).toLocaleString()} died${cause}`),
+        warn.length ? el("div", { class: "glance-warn" }, warn.join(" · ")) : null);
+    });
+  }
+
+  updateAIActions() {
+    const box = document.getElementById("ai-actions");
+    if (!box) return;
+    const st = this.ai.status;
+    if (!st) {
+      box.replaceChildren(el("p", { class: "muted small" }, "Checking the AI connection…"));
+      return;
+    }
+    if (!st.configured) {
+      box.replaceChildren(el("div", { class: "ai-setup" },
+        el("strong", {}, "🔑 Add your Claude API key to switch on the analyst"),
+        el("ol", {},
+          el("li", {}, "Open ", el("code", {}, st.env_file)),
+          el("li", {}, "Paste your key after ", el("code", {}, "ANTHROPIC_API_KEY="), " and save the file"),
+          el("li", {}, "Click Check again. No restart needed.")),
+        el("button", { class: "pill small", onclick: () => this.refreshAIStatus().then(() => this.updateAIActions()) }, "🔄 Check again")));
+      return;
+    }
+    const gone = new Map();
+    for (const e of st.extinctions) gone.set(e.species, e);
+    const buttons = [el("button", { class: "pill accent", onclick: () => this.askAI({ kind: "summary" }) }, "📜 Summarize this run")];
+    for (const e of gone.values()) {
+      buttons.push(el("button", { class: "pill", onclick: () => this.askAI({ kind: "extinction", species: e.species }) },
+        `💀 Why did the ${plural(e.species).toLowerCase()} die out? (day ${e.day})`));
+    }
+    const input = el("input", { type: "text", maxlength: 600, placeholder: "Ask anything, e.g. why do rabbits crash every winter?", "aria-label": "Question for the AI analyst" });
+    const form = el("form", {
+      class: "ai-ask", onsubmit: (ev) => {
+        ev.preventDefault();
+        const q = input.value.trim();
+        if (q) {
+          this.askAI({ kind: "question", question: q });
+          input.value = "";
+        }
+      },
+    }, input, el("button", { class: "pill accent", type: "submit" }, "Ask"));
+    box.replaceChildren(el("div", { class: "ai-buttons" }, buttons), form,
+      el("p", { class: "muted small" }, `Claude (${st.model}) reads this run's records and a map, then explains what happened and backs it up with days and numbers. Each answer is sent to Anthropic's API and uses your key's credit.`));
+  }
+
+  updateAIAnswers() {
+    const box = document.getElementById("ai-answers");
+    if (!box) return;
+    if (!this.ai.answers.length) {
+      box.replaceChildren(el("div", { class: "ai-intro" },
+        el("h3", {}, "Why did that happen?"),
+        el("p", {}, "The AI analyst reads everything this run recorded: births and deaths by cause for every day, who was left before an extinction and how they died, food, weather, territories, your sandbox actions and a map of the world. It explains what happened and proves why, quoting the days and numbers."),
+        el("p", { class: "muted small" }, "Nothing is sent until you ask. Pick a button on the left or type a question.")));
+      return;
+    }
+    box.replaceChildren(...this.ai.answers.map((a) => this.answerView(a)));
+    box.scrollTop = 0;
+  }
 }
+
+// Premade maps. Starting numbers are scaled to the land so the food supply is
+// about the same per animal, and immigration to the length of the edge, where
+// newcomers arrive. A fox territory needs roughly 28 x 28 cells, so on the tiny
+// plot one fox pair fills it; populations that small swing wildly, so its run
+// keeps going through extinctions and newcomers refill it.
+const MAPS = {
+  standard: { label: "🌳 Standard meadow (160 × 100)", width: 160, height: 100, water: 12, forest: 12, rock: 5, immigration: 0.001, initial: { rabbit: 160, fox: 14 } },
+  small: { label: "🏡 Small valley (80 × 50): about 4 fox territories", width: 80, height: 50, water: 10, forest: 10, rock: 3, immigration: 0.0005, initial: { rabbit: 50, fox: 4 } },
+  tiny: { label: "🔬 Tiny test plot (48 × 32): one fox pair and a few rabbits to watch closely", width: 48, height: 32, water: 8, forest: 6, rock: 0, immigration: 0.0006, keepGoing: true, initial: { rabbit: 24, fox: 2 } },
+  lakes: { label: "🏞️ Lake district (160 × 100, lots of water)", width: 160, height: 100, water: 30, forest: 10, rock: 3, immigration: 0.001, initial: { rabbit: 120, fox: 10 } },
+  plains: { label: "🌾 Open plains (160 × 100, little cover)", width: 160, height: 100, water: 6, forest: 3, rock: 2, immigration: 0.001, initial: { rabbit: 180, fox: 16 } },
+  wild: { label: "⛰️ Wild uplands (200 × 130, forest and rock)", width: 200, height: 130, water: 12, forest: 25, rock: 12, immigration: 0.0013, initial: { rabbit: 200, fox: 18 } },
+  custom: { label: "✏️ Custom (set the numbers below)" },
+};
+
+const CAUSE_LABEL = {
+  predation: "predation", starvation: "starvation", dehydration: "thirst", "old age": "old age", disease: "disease",
+  fighting: "fights", emigrated: "emigration", removed: "removal by you",
+};

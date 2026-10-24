@@ -117,6 +117,10 @@ class Species:
     mate_range: float
     territory: float = 0.0
     hazard: float = 0.0  # extra background mortality per tick (diseases such as mange, accidents)
+    eyes_open: float = 0.3  # newborns are blind until this fraction of the weaning age
+    choosiness: float = 0.5  # how strongly females turn down males in poor shape (0 = not at all)
+    eats_fruit: bool = False  # forages for wild fruit in season
+    eats_voles: bool = False  # hunts small rodents by mousing (see rodents.py)
     # Territory size follows food (the resource dispersion hypothesis, Macdonald
     # 1983): new territories are spaced `territory` apart at this prey density
     # (per 1000 land cells), closer where prey are richer, wider where poorer.
@@ -166,6 +170,8 @@ RABBIT = Species(
         "appetite": Trait(mean=1.0, cv=0.15, heritability=0.3, lo=0.4, hi=2.5, loci=4, label="Appetite", unit="×"),
         "libido": Trait(mean=1.0, cv=0.15, heritability=0.3, lo=0.3, hi=2.5, loci=4, label="Mating drive", unit="×"),
         "learning": Trait(mean=0.25, cv=0.3, heritability=0.3, lo=0.02, hi=0.9, loci=4, label="Learning rate", unit=""),
+        # Longer pregnancies give bigger, better-provisioned young but cost the mother more.
+        "gestation": Trait(mean=1.0, cv=0.04, heritability=0.3, lo=0.85, hi=1.2, loci=4, label="Gestation length", unit="×"),
     },
     genes=(
         Gene(symbol="A", name="Agouti", alleles=("A", "a"), freqs=(0.8, 0.2),
@@ -179,6 +185,9 @@ RABBIT = Species(
              note="d/d dilutes black to blue and chocolate to lilac"),
         Gene(symbol="En", name="English spotting", alleles=("en", "En"), freqs=(0.93, 0.07), incomplete=True,
              note="En/en is broken-patterned; En/En (charlie) is mostly white and less healthy"),
+        Gene(symbol="Mo", name="Winter moult", alleles=("M", "m"), freqs=(0.03, 0.97),
+             note="M (dominant) moults to a white winter coat, timed by day length, as mountain and snowshoe hares "
+                  "do (Jones et al. 2018); a rare variant here, for selection to work on where snow lies long"),
     ),
     coat="rabbit",
     ref_mass=1.6,
@@ -223,6 +232,8 @@ RABBIT = Species(
     graze_min=0.15,
     giving_up=0.06,
     carcass_energy=200,
+    eyes_open=0.4,  # kits open their eyes at about 10 days, weaned at about 25
+    choosiness=0.4,  # rabbits: mostly male rank decides who mates (von Holst et al.); females are less choosy
     burrow_reach=8.0,
     fid=2.0,
     fid_per_cell=0.25,
@@ -247,6 +258,7 @@ FOX = Species(
         "libido": Trait(mean=1.0, cv=0.15, heritability=0.3, lo=0.3, hi=2.5, loci=4, label="Mating drive", unit="×"),
         "persistence": Trait(mean=1.0, cv=0.2, heritability=0.3, lo=0.3, hi=3.0, loci=4, label="Chase persistence", unit="×"),
         "learning": Trait(mean=0.25, cv=0.3, heritability=0.3, lo=0.02, hi=0.9, loci=4, label="Learning rate", unit=""),
+        "gestation": Trait(mean=1.0, cv=0.04, heritability=0.3, lo=0.85, hi=1.2, loci=4, label="Gestation length", unit="×"),
     },
     genes=(
         Gene(symbol="S", name="Silver", alleles=("S", "s"), freqs=(0.85, 0.15), incomplete=True,
@@ -256,6 +268,10 @@ FOX = Species(
         Gene(symbol="W", name="Platinum", alleles=("w", "Wp"), freqs=(0.96, 0.04), incomplete=True,
              labels=("w", "Wᵖ"), lethal="Wp",
              note="Wᵖ/w gives white-blazed platinum foxes; Wᵖ/Wᵖ embryos die"),
+        Gene(symbol="Mo", name="Winter white", alleles=("Mo", "mo"), freqs=(0.86, 0.14),
+             labels=("Mo", "mo"),
+             note="mo/mo (recessive) moults to a white winter coat, like the Arctic fox's white morph (MC1R; "
+                  "Våge et al. 2005); red foxes lack it, so it is a rare variant here for selection to work on"),
     ),
     coat="fox",
     ref_mass=6.0,
@@ -298,10 +314,14 @@ FOX = Species(
     dispersal=30,
     mate_range=40,
     territory=28,
+    eyes_open=0.25,  # cubs open their eyes at about two weeks, weaned at about seven
+    choosiness=1.0,  # vixens rely on the male to feed them and the cubs, so they are choosy
+    eats_fruit=True,
+    eats_voles=True,
     # Wild red foxes lose 30-60% of adults a year (Devenish-Nelson et al. 2013), much
     # of it to sarcoptic mange and accidents (Soulsbury et al. 2007): about 20% a year here.
     hazard=6e-5,
-    territory_prey=27.0,  # about 350 rabbits on the default map
+    territory_prey=80.0,  # food per 1000 land cells (rabbit-equivalents, rabbits plus voles) for a normal-sized territory
     dispersal_season=(0.55, 0.85),  # autumn to early winter, before the mating season
     helper_chance=0.4,
     max_helpers=2,
@@ -334,6 +354,12 @@ class SimConfig:
     end_on_extinction: bool = True  # stop the run when a species dies out
     brains: str = "neural"  # "neural": evolving neural networks; "rules": hand-written instincts
     learning: bool = True  # neural brains also learn from experience during each animal's life
+    super_animals: bool = False  # for fun: much faster evolution, no natural ceilings on traits
+    evolution_speed: float = 6.0  # super animals mode: how many times faster evolution runs
+    learning_speed: float = 2.0  # super animals mode: how many times faster brains learn
+    inherit_learning: float = 0.5  # super animals mode: share of the parents' know-how their young start with
+    emigration: bool = True  # floaters that find no territory leave the area (off: they stay and keep trying)
+    climate: str = "temperate"  # see engine/climate.py: temperate, arctic, desert, mountains, grassland, mixed
     mutation: float = 1.0  # multiplier on all mutation rates
     immigration: float = 0.001
     stats_interval: int = 20
@@ -349,7 +375,14 @@ TUNABLE = {
     "plant_growth": (0.0005, 0.05),
     "mutation": (0.0, 20.0),
     "immigration": (0.0, 0.01),
+    "evolution_speed": (1.0, 20.0),
+    "learning_speed": (1.0, 10.0),
+    "inherit_learning": (0.0, 0.8),
 }
+
+
+# Map size in cells (the premade maps in the New world dialog set these).
+MAP_SIZE = {"width": (40, 240), "height": (30, 160)}
 
 
 def build_config(settings: dict) -> SimConfig:
@@ -359,11 +392,21 @@ def build_config(settings: dict) -> SimConfig:
     for key, (lo, hi) in TUNABLE.items():
         if key in settings:
             changes[key] = min(hi, max(lo, float(settings[key])))
-    for key in ("seasons", "end_on_extinction", "learning"):
+    for key, (lo, hi) in MAP_SIZE.items():
+        if key in settings:
+            changes[key] = int(min(hi, max(lo, int(float(settings[key])))))
+    for key in ("seasons", "end_on_extinction", "learning", "super_animals", "emigration"):
         if key in settings:
             changes[key] = bool(settings[key])
     if settings.get("brains") in ("neural", "rules"):
         changes["brains"] = settings["brains"]
+    from .climate import CLIMATES  # local import: climate imports terrain, which needs nothing from here
+    if settings.get("climate") in CLIMATES:
+        changes["climate"] = settings["climate"]
+        # The climate's typical landscape, unless the settings say otherwise.
+        for key, value in CLIMATES[settings["climate"]]["terrain"].items():
+            if f"{key}_fraction" not in settings:
+                changes[f"{key}_fraction"] = value / 100
     initial = settings.get("initial", {})
     species = tuple(
         replace(s, initial=min(2000, max(0, int(initial[s.name])))) if s.name in initial else s
@@ -374,9 +417,40 @@ def build_config(settings: dict) -> SimConfig:
 
 def settings_of(cfg: SimConfig) -> dict:
     out = {key: getattr(cfg, key) for key in TUNABLE}
+    out["width"], out["height"] = cfg.width, cfg.height
     out["seasons"] = cfg.seasons
     out["end_on_extinction"] = cfg.end_on_extinction
     out["brains"] = cfg.brains
     out["learning"] = cfg.learning
+    out["super_animals"] = cfg.super_animals
+    out["emigration"] = cfg.emigration
+    out["climate"] = cfg.climate
     out["initial"] = {s.name: s.initial for s in cfg.species}
     return out
+
+
+# ---------------------------------------------------------------- super animals mode
+# Not realistic, just for fun: mutation is far more frequent, inherited
+# variation is larger and more heritable, and traits have no natural ceiling,
+# so natural selection can push animals far beyond anything real. How much
+# faster is up to the user (the evolution speed, 1-20x, default 6x). Brains
+# can learn faster too (1-10x, default 2x), and young start life with part of
+# what their parents learned (brain wiring, hunting skill, wariness), so
+# know-how builds up over the generations as well as genes.
+
+SUPER_CEILING = {"speed": 1.25, "vision": 1.6}  # these stay moderate so the engine stays sound; others x3
+
+
+def super_spread(speed: float) -> float:
+    """Extra inherited variation (and heritability) at an evolution speed: 1.5x at the default 6x."""
+    return min(2.0, 1.0 + 0.1 * (speed - 1.0))
+
+
+def supercharge(sp: Species, speed: float = 6.0) -> Species:
+    spread = super_spread(speed)
+    traits = {}
+    for name, t in sp.traits.items():
+        hi = 0.95 if name == "learning" else t.hi * SUPER_CEILING.get(name, 3.0)
+        traits[name] = replace(t, hi=round(hi, 3), lo=round(t.lo * 0.5, 3), cv=round(t.cv * spread, 3),
+                               heritability=round(min(0.9, t.heritability * spread), 2))
+    return replace(sp, traits=traits)

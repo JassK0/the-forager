@@ -43,6 +43,8 @@ const C = {
   rock: linear("#9a9aa2"),
   rockDark: linear("#7c7c86"),
   snow: linear("#f4f7fb"),
+  tundra: linear("#8e9a62"),
+  steppe: linear("#cdbb7a"),
   autumn: linear("#c8a24a"),
   tuftSpring: linear("#77d65a"),
   tuftSummer: linear("#4fae3c"),
@@ -118,7 +120,7 @@ export class World3D {
 
   // ------------------------------------------------------------------ terrain
 
-  setTerrain(info, terrain) {
+  setTerrain(info, terrain, keepView = false) {
     for (const obj of this.groups) {
       this.scene.remove(obj);
       obj.traverse?.((o) => {
@@ -134,6 +136,18 @@ export class World3D {
     for (let i = 0; i < W * H; i++) this.heights[i] = hb[i] / 20;
     this.fertility = decode(terrain.fertility);
     this.version = terrain.version;
+    // Climate: each cell's temperature offset and dryness (engine/climate.py).
+    const cl = terrain.climate;
+    this.uniformClimate = !cl || cl.name === "temperate";
+    this.climateOff = new Float32Array(W * H);
+    this.climateDry = new Float32Array(W * H);
+    if (cl && !this.uniformClimate) {
+      const o = decode(cl.offset), d = decode(cl.dry);
+      for (let i = 0; i < W * H; i++) {
+        this.climateOff[i] = (o[i] / 255) * 2.1 - 1.2;
+        this.climateDry[i] = d[i] / 255;
+      }
+    }
 
     const shadowSpan = Math.max(W, H) / 2 + 12;
     Object.assign(this.sun.shadow.camera, { left: -shadowSpan, right: shadowSpan, top: shadowSpan, bottom: -shadowSpan, near: 1, far: 500 });
@@ -193,6 +207,7 @@ export class World3D {
 
     this._buildTrees(m, q, v, s);
     this._buildRocks(m, q, v, s);
+    this._buildBushes(terrain.bushes ? decode(terrain.bushes) : null, m, q, v, s);
     this.burrows = new THREE.InstancedMesh(box(0.7, 0.12, 0.7), new THREE.MeshLambertMaterial({ color: "#5a3d26" }), 2048);
     this.burrows.count = 0;
     this.burrows.receiveShadow = true;
@@ -207,7 +222,8 @@ export class World3D {
     this.add(this.cacheMounds);
 
     this.season = null;
-    this.frameCamera();
+    if (!keepView) this.frameCamera(); // a repaint keeps the camera where it is
+    this.clearPaintMarks();
   }
 
   add(obj) {
@@ -220,7 +236,9 @@ export class World3D {
     this.trees = [];
     for (let i = 0; i < W * H; i++) {
       if (this.types[i] !== T.TREE) continue;
-      this.trees.push({ cell: i, conifer: hash(i, 11) < 0.4, size: 0.8 + 0.5 * hash(i, 12), autumn: Math.floor(hash(i, 13) * 3) });
+      // Conifers dominate where it is cold (taiga, mountain slopes).
+      const conifer = hash(i, 11) < 0.4 + Math.min(0.55, Math.max(0, -this.climateOff[i]) * 1.2);
+      this.trees.push({ cell: i, conifer, size: 0.8 + 0.5 * hash(i, 12), autumn: Math.floor(hash(i, 13) * 3) });
     }
     const n = Math.max(1, this.trees.length);
     this.trunks = new THREE.InstancedMesh(box(0.28, 1, 0.28), new THREE.MeshLambertMaterial({ color: new THREE.Color().setRGB(...C.trunk) }), n);
@@ -270,6 +288,60 @@ export class World3D {
     this.add(this.boulders);
   }
 
+  // Fruiting bushes (brambles, wild apples) at woodland edges, with berries
+  // that ripen from late summer and disappear as foxes eat them.
+  _buildBushes(mask, m, q, v, s) {
+    const W = this.W, H = this.H;
+    this.bushCells = [];
+    if (mask) for (let i = 0; i < W * H; i++) if (mask[i]) this.bushCells.push(i);
+    const n = Math.max(1, this.bushCells.length);
+    this.bushes = new THREE.InstancedMesh(box(1, 1, 1), new THREE.MeshLambertMaterial({ color: 0xffffff }), n);
+    this.bushes.count = this.bushCells.length;
+    this.bushes.castShadow = this.bushes.receiveShadow = true;
+    const leaf = new THREE.Color("#2f6b3a"), leafDark = new THREE.Color("#244f2c");
+    this.bushCells.forEach((i, k) => {
+      const x = i % W, y = (i / W) | 0;
+      q.setFromAxisAngle(new THREE.Vector3(0, 1, 0), hash(i, 51) * Math.PI);
+      this.bushes.setMatrixAt(k, m.compose(v.set(x + 0.5 - W / 2, this.heights[i] + 0.22, y + 0.5 - H / 2), q,
+        s.set(0.62 + 0.2 * hash(i, 52), 0.42 + 0.18 * hash(i, 53), 0.62 + 0.2 * hash(i, 54))));
+      this.bushes.setColorAt(k, leaf.clone().lerp(leafDark, hash(i, 55)));
+    });
+    this.add(this.bushes);
+    // Up to four berries per bush, shown according to how much ripe fruit it carries.
+    this.berries = new THREE.InstancedMesh(box(0.2, 0.2, 0.2), new THREE.MeshLambertMaterial({ color: 0xffffff }), n * 4);
+    this.berries.count = this.bushCells.length * 4;
+    const kinds = [new THREE.Color("#6b2a8c"), new THREE.Color("#e2412f"), new THREE.Color("#8e2fa0")];
+    this.bushCells.forEach((i, k) => {
+      for (let j = 0; j < 4; j++) this.berries.setColorAt(k * 4 + j, kinds[Math.floor(hash(i, 56) * kinds.length)]);
+    });
+    this.add(this.berries);
+    this.updateFruit(null);
+  }
+
+  updateFruit(fruit) {
+    if (!this.berries) return;
+    const W = this.W, H = this.H;
+    const m = new THREE.Matrix4(), zero = new THREE.Matrix4().makeScale(0, 0, 0);
+    this.bushCells.forEach((i, k) => {
+      const shown = fruit ? Math.round((fruit[i] / 255) * 4) : 0;
+      const x = i % W, y = (i / W) | 0;
+      for (let j = 0; j < 4; j++) {
+        if (j >= shown) {
+          this.berries.setMatrixAt(k * 4 + j, zero);
+          continue;
+        }
+        // On the surface of the bush: one on top, the rest round the sides.
+        const a = (j / 4) * Math.PI * 2 + hash(i, 60) * Math.PI;
+        const r = j === 0 ? 0.05 : 0.4;
+        const up = j === 0 ? 0.56 : 0.3 + 0.15 * hash(i, 64 + j);
+        m.makeTranslation(x + 0.5 - W / 2 + Math.cos(a) * r, this.heights[i] + up, y + 0.5 - H / 2 + Math.sin(a) * r);
+        this.berries.setMatrixAt(k * 4 + j, m);
+      }
+    });
+    this.berries.instanceMatrix.needsUpdate = true;
+    this.berries.computeBoundingSphere();
+  }
+
   // Start close enough to see the animals; ?zoom=N in the URL scales the distance.
   frameCamera() {
     const zoom = Number(new URLSearchParams(location.search).get("zoom")) || 1;
@@ -280,10 +352,17 @@ export class World3D {
   }
 
   // Seasonal colours and plant cover. Called whenever a new plant grid arrives.
+  // Snow on one cell: the same everywhere on a temperate map, otherwise set by
+  // the local temperature, and thin where it is too dry for much to fall.
+  snowAt(i, env) {
+    if (this.uniformClimate) return env.snow;
+    const t = env.temperature + this.climateOff[i];
+    return Math.min(1, Math.max(0, (-t - 0.35) / 0.4)) * (1 - 0.8 * this.climateDry[i]);
+  }
+
   updateGround(plants, env) {
     if (!this.ground) return;
     const W = this.W, H = this.H, N = W * H;
-    const snow = env.snow;
     const f = env.year_fraction;
     const autumn = smooth(0.45, 0.6, f) * (1 - smooth(0.75, 0.82, f));
     const spring = 1 - smooth(0.12, 0.3, f) + smooth(0.92, 1.0, f);
@@ -291,6 +370,7 @@ export class World3D {
     for (let i = 0; i < N; i++) {
       const t = this.types[i];
       const shade = 0.93 + 0.1 * hash(i, 1);
+      const snow = this.snowAt(i, env);
       let c;
       if (t === T.WATER) c = C.bed;
       else if (t === T.SAND) c = C.sand;
@@ -299,7 +379,11 @@ export class World3D {
         if (this.heights[i] > 3.4) c = mix(c, C.snow, Math.max(0.55, snow));
       } else {
         const b = plants ? Math.min(1, plants[i] / 200) : 0.6;
-        const green = t === T.FOREST ? C.forestFloor : mix(C.grassDry, C.grassLush, this.fertility[i] / 255);
+        let green = t === T.FOREST ? C.forestFloor : mix(C.grassDry, C.grassLush, this.fertility[i] / 255);
+        if (!this.uniformClimate) {
+          green = mix(green, C.tundra, Math.min(0.8, Math.max(0, -this.climateOff[i] - 0.2)));  // tundra: olive, mossy
+          green = mix(green, C.steppe, Math.min(0.85, this.climateDry[i]));  // dry country: straw-coloured
+        }
         c = mix(C.dirt, mix(green, C.autumn, autumn * 0.6), Math.min(1, b * 1.3));
       }
       if (t !== T.WATER) c = mix(c, C.snow, snow * (t === T.ROCK ? 0.6 : 0.92));
@@ -318,6 +402,7 @@ export class World3D {
       const b = plants ? plants[i] / 255 : 0.5;
       // Only lush cells sprout a tuft; each is scattered and turned so the
       // meadow doesn't read as a grid.
+      const snow = this.snowAt(i, env);
       const hgt = b < 0.3 || snow > 0.7 ? 0 : 0.04 + 0.3 * b;
       const x = i % W, y = (i / W) | 0;
       const o = k * 16;
@@ -346,7 +431,7 @@ export class World3D {
     this.flowerCells.forEach((i, k) => {
       const x = i % W, y = (i / W) | 0;
       const b = plants ? plants[i] / 255 : 0.5;
-      const on = bloom && b > 0.35 && snow < 0.2;
+      const on = bloom && b > 0.35 && this.snowAt(i, env) < 0.2;
       fm.makeScale(on ? 1 : 0, on ? 1 : 0, on ? 1 : 0);
       fm.setPosition(x + 0.5 - W / 2 + (hash(i, 9) - 0.5) * 0.5, this.heights[i] + 0.05 + 0.42 * b, y + 0.5 - H / 2 + (hash(i, 10) - 0.5) * 0.5);
       this.flowers.setMatrixAt(k, fm);
@@ -358,7 +443,7 @@ export class World3D {
   }
 
   _seasonTrees(env, autumn, spring) {
-    const key = `${env.season}:${Math.round(env.snow * 10)}:${Math.round(autumn * 10)}`;
+    const key = `${env.season}:${Math.round(env.temperature * 10)}:${Math.round(autumn * 10)}`;
     if (key === this.season || !this.trees.length) return;
     this.season = key;
     const zero = new THREE.Matrix4().makeScale(0, 0, 0);
@@ -367,10 +452,11 @@ export class World3D {
       for (let j = 0; j < 3; j++) {
         let c;
         let visible = !(j === 2 && !t.conifer);
-        if (t.conifer) c = mix(C.conifer, C.snow, env.snow * (j === 2 ? 0.8 : 0.55));
+        const snow = this.snowAt(t.cell, env);
+        if (t.conifer) c = mix(C.conifer, C.snow, snow * (j === 2 ? 0.8 : 0.55));
         else {
           c = mix(mix(C.leafSummer, C.leafSpring, spring), C.leafAutumn[t.autumn], autumn);
-          if (env.season === "winter" && env.snow > 0.3) visible = false; // bare deciduous trees
+          if (env.season === "winter" && snow > 0.3) visible = false; // bare deciduous trees
         }
         this.leaves.setMatrixAt(k * 3 + j, visible ? t.leafMatrices[j] : zero);
         this.leaves.setColorAt(k * 3 + j, color.setRGB(...scale(c, 0.9 + 0.2 * hash(t.cell, 30 + j))));
@@ -379,7 +465,7 @@ export class World3D {
     this.leaves.instanceMatrix.needsUpdate = true;
     this.leaves.instanceColor.needsUpdate = true;
     this.boulders.instanceColor && this.boulderCells.forEach((i, k) => {
-      const c = mix(mix(C.rock, C.rockDark, hash(i, 29)), C.snow, env.snow * 0.7);
+      const c = mix(mix(C.rock, C.rockDark, hash(i, 29)), C.snow, this.snowAt(i, env) * 0.7);
       this.boulders.setColorAt(k, color.setRGB(...c));
     });
     if (this.boulders.instanceColor) this.boulders.instanceColor.needsUpdate = true;
@@ -480,6 +566,29 @@ export class World3D {
     ring.visible = false;
     this.cursor = ring;
     this.scene.add(ring);
+    this.paintMarks = new THREE.InstancedMesh(new THREE.CircleGeometry(1, 24).rotateX(-Math.PI / 2),
+      new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.55, depthWrite: false }), 256);
+    this.paintMarks.count = 0;
+    this.paintMarks.renderOrder = 9;
+    this.paintMarks.frustumCulled = false;
+    this.scene.add(this.paintMarks);
+  }
+
+  // A painted spot shown straight away, until the rebuilt terrain replaces it.
+  paintMark(x, y, radius, color) {
+    const k = this.paintMarks.count;
+    if (k >= this.paintMarks.instanceMatrix.count) return;
+    const m = new THREE.Matrix4().makeScale(radius, 1, radius);
+    m.setPosition(x - this.W / 2, this.groundY(x, y) + 0.12, y - this.H / 2);
+    this.paintMarks.setMatrixAt(k, m);
+    this.paintMarks.setColorAt(k, new THREE.Color(color));
+    this.paintMarks.count = k + 1;
+    this.paintMarks.instanceMatrix.needsUpdate = true;
+    if (this.paintMarks.instanceColor) this.paintMarks.instanceColor.needsUpdate = true;
+  }
+
+  clearPaintMarks() {
+    if (this.paintMarks) this.paintMarks.count = 0;
   }
 
   showCursor(point, radius, color) {

@@ -46,6 +46,7 @@ EVOLVE_WORDS = {
     "libido": ("a stronger mating drive", "a weaker mating drive"),
     "persistence": ("more persistent chasing", "shorter chases"),
     "learning": ("faster learning", "slower learning"),
+    "gestation": ("longer pregnancies", "shorter pregnancies"),
 }
 COMPARE_WORDS = {
     "mass": ("heavier", "lighter"),
@@ -61,6 +62,7 @@ COMPARE_WORDS = {
     "libido": ("keener to mate", "less keen to mate"),
     "persistence": ("more persistent", "quicker to give up"),
     "learning": ("quicker learners", "slower learners"),
+    "gestation": ("born of longer pregnancies", "born of shorter pregnancies"),
 }
 # Why a trait difference between victims and survivors matters: (trait, cause, victims lower?)
 MECHANISMS = {
@@ -89,6 +91,8 @@ MECHANISMS = {
     ("persistence", "starvation", False): "long chases burn more energy than they win",
     ("learning", "starvation", False): "a fast-learning brain is expensive to run",
     ("learning", "predation", True): "slow learners keep going back to dangerous places",
+    ("gestation", "starvation", True): "young from short pregnancies are born small, with little in reserve",
+    ("gestation", "starvation", False): "long pregnancies wear mothers down",
 }
 # What each decision option means, for explanations ("where instincts said X, they now Y").
 OPTION_VERBS = {"eat": "eat", "drink": "drink", "mate": "look for a mate", "rest": "rest",
@@ -137,6 +141,7 @@ class Window:
         self.juvenile_deaths = Counter()
         self.trait_sums = {}  # cause -> {trait: sum}
         self.lum_sums = Counter()  # cause -> sum of coat luminance
+        self.gap_sums = Counter()  # cause -> sum of camouflage gaps (coat against the ground)
         self.allele_deaths = {}  # cause -> {symbol: [copies per allele]}
         self.parents = 0
         self.parent_traits = {t: 0.0 for t in sp.traits}
@@ -147,8 +152,9 @@ class Window:
         self.weak = 0
         self._sp = sp
 
-    def death(self, a, cause: str) -> None:
+    def death(self, a, cause: str, gap: float = 0.0) -> None:
         self.deaths[cause] += 1
+        self.gap_sums[cause] += gap
         if not a.adult:
             self.juvenile_deaths[cause] += 1
         sums = self.trait_sums.setdefault(cause, {t: 0.0 for t in self._sp.traits})
@@ -177,6 +183,7 @@ class Window:
             out.deaths.update(w.deaths)
             out.juvenile_deaths.update(w.juvenile_deaths)
             out.lum_sums.update(w.lum_sums)
+            out.gap_sums.update(w.gap_sums)
             for cause, sums in w.trait_sums.items():
                 dst = out.trait_sums.setdefault(cause, {t: 0.0 for t in sp.traits})
                 for t, v in sums.items():
@@ -243,6 +250,7 @@ class Narrator:
                 "traits": {t: sum(a.traits[t] for a in adults) / len(adults) for t in sp.traits} if adults else None,
                 "breeding": {t: sp.traits[t].mean * sum(a.breeding[t] for a in members) / n for t in sp.traits} if n else None,
                 "lum": sum(a.coat_lum for a in members) / n if n else None,
+                "gap": sum(w.camouflage_gap(a) for a in members) / n if n else None,
                 "energy": sum(a.energy / a.max_energy for a in members) / n if n else None,
                 "vigor": sum(a.vigor for a in members) / n if n else None,
                 "het": sum(a.het for a in members) / (n * max(1, sp.markers)) if n else None,
@@ -385,6 +393,26 @@ class Narrator:
         return self._emit(icon="🎓", title=f"{names.capitalize()} are learning from experience", text=text,
                           species=sp.name, level="minor", chart={"tab": "brains", "species": sp.name})
 
+    def new_alpha(self, si: int, a, power: float) -> dict | None:
+        """Super animals mode: announce a top animal the first time it takes the
+        crown (at most one announcement every three days per species)."""
+        crowned = self.__dict__.setdefault("_crowned", set())
+        if a.id in crowned or not self._ready(f"alpha{si}", 3 * self.w.cfg.ticks_per_day):
+            return None
+        crowned.add(a.id)
+        from .world import animal_name  # local import: world imports this module
+        sp = self.w.species[si]
+        ref = sp.traits
+        best = sorted(((a.traits[t] / ref[t].mean, ref[t].label.lower()) for t in ("speed", "vision", "mass", "learning")
+                       if t in a.traits), reverse=True)[:2]
+        bits = _join([f"{x:.1f}× the founders' {label}" for x, label in best])
+        return self._emit(icon="👑", title=f"A new alpha {sp.name}: {animal_name(a.id)}",
+                          text=(f"{animal_name(a.id)} is now the strongest {sp.name} alive, with {power:.1f}× the founders' "
+                                f"overall prowess: {bits}. In Super animals mode evolution runs "
+                                f"{self.w.cfg.evolution_speed:g}× faster, brains learn {self.w.cfg.learning_speed:g}× faster "
+                                "and traits have no natural ceiling, so watch what selection builds."),
+                          species=sp.name, level="minor", chart={"tab": "traits", "species": sp.name})
+
     def _ago(self, ticks: int):
         """The newest snapshot at least ``ticks`` old, or None."""
         now = self.snaps[-1]["tick"]
@@ -475,6 +503,14 @@ class Narrator:
             "winter": "Plants barely grow and the cold raises every animal's energy bill, so expect starvation. "
                       "Snow makes pale coats better camouflage than dark ones. Foxes mate in late winter.",
         }[season]
+        if season == "winter" and not self.w.climate.uniform:
+            land = self.w._land_mask()
+            share = self.w.climate.snow_share(min(self.w.season_temp, -0.95), land)
+            if share < 0.15:
+                text = ("Plants barely grow and nights are cold, so expect hunger, but there is little or no snow here: "
+                        "white winter coats stand out instead of hiding. Foxes mate in late winter.")
+            elif share < 0.7:
+                text += f" Snow will cover only part of this land (about {round(100 * share)}% at its deepest)."
         icon = {"spring": "🌱", "summer": "☀️", "autumn": "🍂", "winter": "❄️"}[season]
         self._emit(icon=icon, title=f"{season.capitalize()} has arrived", text=text, level="info")
 
@@ -580,11 +616,10 @@ class Narrator:
             preds = self._predator_counts(si, new)
             preds0 = self._predator_counts(si, old)
             text = f"Predators took {win.deaths['predation']}: there are {preds} predators now (from {preds0})."
-            lum_dead = win.lum_sums["predation"] / max(1, win.deaths["predation"])
-            if s1["lum"] is not None and new["env"]["snow"] > 0.5 and lum_dead < s1["lum"] - 0.04:
-                text += " On the snow, darker coats stand out, and the victims were darker than average."
-            elif s1["lum"] is not None and new["env"]["snow"] < 0.2 and lum_dead > s1["lum"] + 0.04:
-                text += " Pale coats stand out against the grass, and the victims were paler than average."
+            gap_dead = win.gap_sums["predation"] / max(1, win.deaths["predation"])
+            if s1.get("gap") is not None and win.deaths["predation"] >= 5 and gap_dead > s1["gap"] + 0.03:
+                text += (f" Camouflage mattered: the animals caught stood out against the ground more than average "
+                         f"(coat-ground contrast {gap_dead:.2f}, against {s1['gap']:.2f} for the living).")
             out.append(text)
         if share.get("dehydration", 0) >= 0.2 and win.deaths["dehydration"] >= 3:
             text = f"{win.deaths['dehydration']} died of thirst."
@@ -1033,6 +1068,11 @@ class Narrator:
             if he and he[0] and he[-1] < 0.85 * he[0]:
                 text += (f" Genetic diversity fell from {he[0]:.2f} to {he[-1]:.2f}, the mark of small population "
                          "sizes and inbreeding.")
+            hunts = w.hunts[si]
+            if hunts["vole"] or hunts["fruit"]:
+                kills = hunts["kill"] + hunts["surplus kill"]
+                text += (f" Their diet: {kills:,} rabbits caught, {hunts['vole']:,} voles, {hunts['scavenged']:,} carcasses "
+                         f"scavenged and {hunts['fruit']:,} meals of wild fruit (mostly in autumn).")
             social = w.social[si]
             if social:
                 bits = []
@@ -1042,6 +1082,10 @@ class Narrator:
                 if social["stayed as helper"]:
                     bits.append(f"{social['stayed as helper']} daughter{'s' if social['stayed as helper'] != 1 else ''} "
                                 "stayed home as helpers")
+                if social["mating contest"]:
+                    bits.append(f"males fought {social['mating contest']} times over females")
+                if social["rejected injured male"]:
+                    bits.append(f"females turned down {social['rejected injured male']} courtships from injured or lame males")
                 if social["inherited"]:
                     bits.append(f"{social['inherited']} helper{'s' if social['inherited'] != 1 else ''} inherited "
                                 "a territory")

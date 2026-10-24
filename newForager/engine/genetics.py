@@ -174,9 +174,10 @@ class GenomeSpec:
                 gene = next(g for g in sp.genes if g.symbol == symbol)
                 forced[symbol] = [gene.alleles.index(a) for a in pair]
             if preset in PRESETS[sp.coat]:
-                # Named colour presets are otherwise wild type at every colour gene.
+                # Named colour presets are otherwise wild type (the commonest allele) at every colour gene.
                 for g in sp.genes:
-                    forced.setdefault(g.symbol, [0, 0])
+                    wild = max(range(len(g.alleles)), key=lambda k: g.freqs[k])
+                    forced.setdefault(g.symbol, [wild, wild])
         haps = ([], [])
         for kind, key in zip(self.kinds, self.keys):
             for h in (0, 1):

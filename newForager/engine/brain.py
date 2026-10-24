@@ -18,7 +18,7 @@ reference, so the simulation can report how far evolved brains have drifted
 from their ancestors' instincts.
 
 Personality genes enter as gains on the inputs (hunger x appetite, mating
-drive x libido, predator distance relative to a boldness-scaled flight
+drive x libido (and how aroused the animal is), predator distance relative to a boldness-scaled flight
 distance, freezing tendency), the way hormones modulate drives, so they matter
 in both modes.
 
@@ -29,8 +29,9 @@ the vertebrate basal ganglia are thought to (actor-critic learning; Barto
 
 * Reward is homeostatic (Keramati & Gutkin 2014): food when hungry and water
   when thirsty feel good in proportion to how much they reduce the drive.
-  Mating feels good. Being lunged at by a predator, seeing one close, or
-  losing a fight feels bad.
+  In the breeding season, breeding hormones build an urge to mate that counts
+  in the same drive, so mating (which also feels good in itself) relieves it.
+  Being lunged at by a predator, seeing one close, or losing a fight feels bad.
 * A critic (an extra output of the network) learns to predict future
   wellbeing. The difference between what happened and what it predicted, the
   reward prediction error, plays the role of dopamine (Schultz, Dayan &
@@ -173,15 +174,19 @@ class BrainTable:
 
     Each row holds an animal's current wiring (w1, w2), the wiring it was born
     with (i1, i2), its critic (v, predicting future wellbeing) and the
-    eligibility traces used by learning."""
+    eligibility traces used by learning. In Super animals mode young are born
+    with part of their parents' know-how on top of their genes (c1, c2, which
+    are included in i1, i2)."""
 
-    ARRAYS = ("w1", "w2", "i1", "i2", "v", "e1", "e2", "hprev", "vprev", "primed")
+    ARRAYS = ("w1", "w2", "i1", "i2", "c1", "c2", "v", "e1", "e2", "hprev", "vprev", "primed")
 
     def __init__(self, capacity: int = 256):
         self.w1 = np.zeros((capacity, N_IN, N_HID), dtype=np.float32)
         self.w2 = np.zeros((capacity, N_HID + 1, N_OUT), dtype=np.float32)
         self.i1 = np.zeros_like(self.w1)
         self.i2 = np.zeros_like(self.w2)
+        self.c1 = np.zeros_like(self.w1)
+        self.c2 = np.zeros_like(self.w2)
         self.v = np.zeros((capacity, N_HID + 1), dtype=np.float32)
         self.e1 = np.zeros_like(self.w1)
         self.e2 = np.zeros_like(self.w2)
@@ -201,6 +206,8 @@ class BrainTable:
         w1, w2 = unpack(vec)
         self.w1[row] = self.i1[row] = w1
         self.w2[row] = self.i2[row] = w2
+        self.c1[row] = 0.0
+        self.c2[row] = 0.0
         self.v[row] = 0.0
         self.e1[row] = 0.0
         self.e2[row] = 0.0
@@ -211,6 +218,20 @@ class BrainTable:
 
     def release(self, row: int) -> None:
         self.free.append(row)
+
+    def know_how(self, row: int) -> tuple[np.ndarray, np.ndarray]:
+        """Everything in an animal's wiring that isn't from its genes: what it was
+        taught at birth plus what it has learned since."""
+        return (self.w1[row] - self.i1[row] + self.c1[row], self.w2[row] - self.i2[row] + self.c2[row])
+
+    def teach(self, row: int, k1: np.ndarray, k2: np.ndarray) -> None:
+        """Start a newborn with know-how on top of its genes."""
+        self.c1[row] = k1
+        self.c2[row] = k2
+        self.i1[row] += k1
+        self.i2[row] += k2
+        self.w1[row] = self.i1[row]
+        self.w2[row] = self.i2[row]
 
     def value(self, rows, hidden: np.ndarray) -> np.ndarray:
         """The critic's prediction of future wellbeing."""
@@ -230,11 +251,23 @@ class BrainTable:
         hp = self.hprev[rows]
         self.v[rows] += (CRITIC_RATE * delta / (np.einsum("nh,nh->n", hp, hp) + 1e-6))[:, None] * hp
         a = plasticity * delta
-        step2 = np.clip((ACTOR_RATE * a)[:, None, None] * self.e2[rows], -MAX_STEP, MAX_STEP)
-        step1 = np.clip((ACTOR_RATE * HIDDEN_RATE * a)[:, None, None] * self.e1[rows], -MAX_STEP, MAX_STEP)
+        # (Worked in place to avoid temporary arrays; the arithmetic is unchanged.)
+        e1, e2 = self.e1[rows], self.e2[rows]
+        step2 = (ACTOR_RATE * a)[:, None, None] * e2
+        np.clip(step2, -MAX_STEP, MAX_STEP, out=step2)
+        step1 = (ACTOR_RATE * HIDDEN_RATE * a)[:, None, None] * e1
+        np.clip(step1, -MAX_STEP, MAX_STEP, out=step1)
         w1, w2 = self.w1[rows], self.w2[rows]
-        w2 += step2 + FORGET * (self.i2[rows] - w2)
-        w1 += step1 + FORGET * (self.i1[rows] - w1)
+        pull = self.i2[rows]
+        pull -= w2
+        pull *= FORGET
+        pull += step2
+        w2 += pull
+        pull = self.i1[rows]
+        pull -= w1
+        pull *= FORGET
+        pull += step1
+        w1 += pull
         self.w1[rows], self.w2[rows] = w1, w2
         # Traces: decay, then add how the chosen option's probability depends on each weight.
         g = -probs.astype(np.float32)
@@ -242,9 +275,13 @@ class BrainTable:
         g = np.where(mask, g, 0.0) / TAU
         h1 = np.concatenate([hidden, np.ones((len(hidden), 1), dtype=hidden.dtype)], axis=1)
         decay = GAMMA * TRACE
-        self.e2[rows] = decay * self.e2[rows] + h1[:, :, None] * g[:, None, :]
+        e2 *= decay
+        e2 += h1[:, :, None] * g[:, None, :]
+        self.e2[rows] = e2
         gh = np.einsum("no,nho->nh", g, w2[:, :N_HID, :]) * (1.0 - hidden ** 2)
-        self.e1[rows] = decay * self.e1[rows] + x[:, :, None] * gh[:, None, :]
+        e1 *= decay
+        e1 += x[:, :, None] * gh[:, None, :]
+        self.e1[rows] = e1
         self.hprev[rows] = h1
         self.vprev[rows] = value
         self.primed[rows] = True

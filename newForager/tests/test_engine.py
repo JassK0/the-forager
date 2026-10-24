@@ -1225,3 +1225,673 @@ def test_a_critical_need_overrides_what_was_learned():
     rabbit.sense(w)
     allowed = [brain.OPTIONS[k] for k, ok in enumerate(rabbit.mask) if ok]
     assert allowed == ["drink"]
+
+
+# ---------------------------------------------------------------- simulation clock
+
+def _wait_for(client, condition, timeout=60.0):
+    import time as _time
+    end = _time.time() + timeout
+    while _time.time() < end:
+        status = client.get("/api/clock").get_json()
+        if condition(status):
+            return status
+        _time.sleep(0.05)
+    raise AssertionError("clock did not get there in time")
+
+
+def test_skipping_ahead_gives_exactly_the_same_world_as_stepping():
+    import app as webapp
+
+    client = webapp.app.test_client()
+    client.post("/api/clock", json={"running": False})
+    client.post("/api/reset", json={"seed": 11, "settings": {"initial": {"rabbit": 40, "fox": 4}}})
+    start = client.get("/api/clock").get_json()["tick"]
+    client.post("/api/clock", json={"skip_days": 0.25})
+    status = _wait_for(client, lambda s: not s["skip"])
+    assert status["tick"] == start + 60 and not status["running"]
+    served = client.post("/api/frame", json={"plants": False}).get_json()
+    w = World(build_config({"initial": {"rabbit": 40, "fox": 4}}), seed=11)
+    for _ in range(status["tick"]):
+        w.step()
+    assert served["animals"] == w.frame(plants=False)["animals"]
+
+
+def test_the_clock_plays_and_pauses():
+    import app as webapp
+
+    client = webapp.app.test_client()
+    client.post("/api/reset", json={"seed": 12, "settings": {"initial": {"rabbit": 30, "fox": 3}}})
+    t0 = client.post("/api/clock", json={"running": True, "speed": 10}).get_json()["tick"]
+    _wait_for(client, lambda s: s["tick"] >= t0 + 10)
+    paused = client.post("/api/clock", json={"running": False}).get_json()
+    import time as _time
+    _time.sleep(0.3)
+    later = client.get("/api/clock").get_json()
+    assert not later["running"] and later["tick"] - paused["tick"] <= 1
+    frame = client.post("/api/frame", json={}).get_json()
+    assert frame["clock"]["tick"] == frame["tick"]
+
+
+# ---------------------------------------------------------------- fruit, blind newborns, gestation, injuries, courtship
+
+from engine.animal import BIRTH_MASS, VISION_FLOOR  # noqa: E402
+from engine.vegetation import FRUIT_CAP, Fruit  # noqa: E402
+
+
+def test_newborns_are_blind_until_their_eyes_open():
+    w = flat_world()
+    _, _, cubs = _fox_family(w)
+    cub = cubs[0]
+    assert cub.sight() == 0.0 and cub.vision == VISION_FLOOR
+    cub.age = int(cub.sp.eyes_open * cub.weaning) + 20
+    cub._allometry()
+    assert 0.0 < cub.sight() < 1.0 and VISION_FLOOR < cub.vision < cub.traits["vision"]
+    cub.age = int(cub.weaning) + 1
+    cub._allometry()
+    assert cub.vision == pytest.approx(cub.traits["vision"])
+
+
+def test_longer_pregnancies_give_bigger_young():
+    sizes = {}
+    for g in (0.9, 1.15):
+        w = flat_world()
+        vixen = put(w, "fox", 20.5, 20.5)
+        dog = put(w, "fox", 22.5, 20.5)
+        vixen.female, dog.female = True, False
+        vixen.traits["gestation"] = g
+        vixen.energy = vixen.max_energy
+        w.mate(vixen, dog)
+        w.give_birth(vixen)
+        w._flush()
+        kids = [k for k in vixen.litter if k.alive]
+        if not kids:
+            pytest.skip("no young survived to birth")
+        sizes[g] = kids[0].birth_frac
+    assert sizes[1.15] == pytest.approx(BIRTH_MASS * 1.15 ** 3)
+    assert sizes[1.15] > sizes[0.9]
+
+
+def test_injuries_slow_an_animal_and_heal():
+    w = flat_world()
+    fox = put(w, "fox", 20.5, 20.5)
+    fast = fox.speed
+    fox.hurt(w, 0.4)
+    assert fox.speed < fast and fox.reward_events < 0
+    fox.energy = fox.max_energy
+    for _ in range(600):
+        fox.energy = fox.max_energy
+        fox.water = fox.max_water
+        fox.update(w)
+        if not fox.alive:
+            pytest.skip("died of other causes")
+    assert fox.injury < 0.4
+
+
+def test_females_turn_down_weak_and_injured_males_and_vixens_are_choosier():
+    w = flat_world()
+    vixen, dog = put(w, "fox", 20.5, 20.5), put(w, "fox", 22.5, 20.5)
+    doe, buck = put(w, "rabbit", 20.5, 22.5), put(w, "rabbit", 22.5, 22.5)
+    vixen.female = doe.female = True
+    dog.female = buck.female = False
+    for m in (dog, buck):
+        m.energy = 0.9 * m.max_energy
+        m.vigor = 1.0
+    healthy = (w.acceptance(vixen, dog), w.acceptance(doe, buck))
+    for m in (dog, buck):
+        m.injury = 0.6
+        m.energy = 0.4 * m.max_energy
+    impaired = (w.acceptance(vixen, dog), w.acceptance(doe, buck))
+    assert healthy[0] > impaired[0] and healthy[1] > impaired[1]
+    assert impaired[0] < impaired[1]  # vixens are choosier than does
+
+
+def test_a_stronger_rival_usually_drives_a_weaker_male_off():
+    w = flat_world()
+    strong, weak = put(w, "rabbit", 20.5, 20.5), put(w, "rabbit", 21.5, 20.5)
+    wins = 0
+    for _ in range(200):
+        strong.energy, weak.energy = strong.max_energy, 0.3 * weak.max_energy
+        weak.injury = 0.5
+        strong.injury = 0.0
+        wins += not w.mating_contest(weak, strong)
+    assert wins > 150
+
+
+def test_fruit_ripens_from_late_summer_and_is_gone_by_winter():
+    assert Fruit.ripeness(0.1, True) == 0.0  # spring
+    assert Fruit.ripeness(0.55, True) == pytest.approx(1.0)  # early autumn
+    assert Fruit.ripeness(0.85, True) == 0.0  # winter
+
+
+def test_foxes_eat_ripe_fruit():
+    w = flat_world()
+    w.fruit.bush[:] = False
+    w.fruit.F[:] = 0.0
+    w.fruit.bush[20, 24] = True
+    w.fruit.F[20, 24] = FRUIT_CAP
+    fox = put(w, "fox", 20.5, 20.5)
+    fox.energy = 0.5 * fox.max_energy
+    fox.skill = 0.2  # a young fox: fruit first
+    fox.act = Act.HUNT
+    w._rebuild_buckets()
+    for _ in range(40):
+        fox._hunt(w) if fox.act == Act.HUNT else fox._eat(w)
+        if w.hunts[_species(w, "fox")]["fruit"]:
+            break
+    assert w.hunts[_species(w, "fox")]["fruit"] == 1 and w.fruit.F[20, 24] < FRUIT_CAP
+
+
+def test_the_memory_map_shows_caches_den_territory_and_marks():
+    w = flat_world()
+    vixen, dog, _ = _fox_family(w)
+    si = _species(w, "fox")
+    vixen.territorial = True
+    w._holders[si][vixen.id] = vixen
+    w.add_cache(vixen, 120.0, vixen.id)
+    vixen.marks.append((25.0, 20.0, w.tick))
+    m = w.inspect(vixen.id)["memory"]
+    assert m["caches"] and m["caches"][0][3]  # food carried home for the young
+    assert m["den"] is not None and m["territory"] is not None and m["marks"]
+
+
+# ---------------------------------------------------------------- pair territories, forays, voles
+
+from engine.rodents import VOLE_CAP, Voles  # noqa: E402
+
+
+def _hold(w, a, x, y, female):
+    a.female = female
+    a.home_x, a.home_y = x, y
+    a.territorial = True
+    w._holders[_species(w, "fox")][a.id] = a
+
+
+def test_a_widowed_territory_is_filled_by_a_newcomer():
+    w = flat_world()
+    si = _species(w, "fox")
+    w._holders[si] = {}
+    vixen = put(w, "fox", 20.5, 20.5)
+    _hold(w, vixen, 20.5, 20.5, True)
+    # Another male's territory nearby would have blocked the old same-sex rule.
+    neighbour = put(w, "fox", 40.5, 20.5)
+    _hold(w, neighbour, 40.5, 20.5, False)
+    floater = put(w, "fox", 60.5, 20.5)
+    floater.female, floater.territorial = False, False
+    w._holders[si].pop(floater.id, None)
+    assert w.settle(floater, 60.0)
+    assert (floater.home_x, floater.home_y) == (20.5, 20.5)
+    assert w.territory_mates(vixen) == [floater]
+
+
+def test_new_territories_keep_their_distance_from_every_other():
+    w = flat_world()
+    si = _species(w, "fox")
+    w._holders[si] = {}
+    vixen = put(w, "fox", 20.5, 20.5)
+    _hold(w, vixen, 20.5, 20.5, True)
+    male = put(w, "fox", 25.5, 20.5)
+    male.female, male.territorial = False, False
+    w._holders[si].pop(male.id, None)
+    # He may join her territory, but not found a separate one right next to it.
+    assert not w.claim_territory(male, 25.5, 20.5)
+    assert w.claim_territory(male, 20.5, 20.5)
+
+
+def test_lone_neighbours_pair_up():
+    w = flat_world()
+    si = _species(w, "fox")
+    w._holders[si] = {}
+    vixen, dog = put(w, "fox", 20.5, 20.5), put(w, "fox", 30.5, 20.5)
+    _hold(w, vixen, 20.5, 20.5, True)
+    _hold(w, dog, 30.5, 20.5, False)
+    assert w.pair_up(dog)
+    assert (dog.home_x, dog.home_y) == (20.5, 20.5)
+
+
+def test_dog_foxes_range_further_for_mates_than_vixens():
+    w = flat_world()
+    vixen, dog = put(w, "fox", 20.5, 20.5), put(w, "fox", 22.5, 20.5)
+    vixen.female, dog.female = True, False
+    assert w.mate_reach(dog) > w.mate_reach(vixen) == vixen.sp.mate_range
+
+
+def test_voles_breed_in_summer_and_dwindle_in_winter():
+    w = flat_world()
+    v = Voles(w.veg)
+    v.V[:] = 0.2 * VOLE_CAP
+    start = v.total()
+    for _ in range(300):
+        v.step(w.veg, breeding=True)
+    summer = v.total()
+    for _ in range(300):
+        v.step(w.veg, breeding=False)
+    assert summer > start and v.total() < summer
+
+
+def test_foxes_catch_voles_by_mousing():
+    w = flat_world()
+    fox = put(w, "fox", 20.5, 20.5)
+    w.voles.V[:] = VOLE_CAP
+    fox.act = Act.HUNT
+    fox.energy = 0.6 * fox.max_energy
+    w._rebuild_buckets()
+    si = _species(w, "fox")
+    for _ in range(80):
+        if fox.act == Act.HUNT:
+            fox._hunt(w)
+        else:
+            fox._eat(w)
+            fox.act = Act.HUNT
+        if w.hunts[si]["vole"]:
+            break
+    assert w.hunts[si]["vole"] >= 1
+
+
+# ---------------------------------------------------------------- prey switching, super animals, movement
+
+from engine.animal import SEARCH_IMAGE_FLOOR  # noqa: E402
+from engine.config import supercharge  # noqa: E402
+
+
+def test_a_foxs_eye_for_rabbits_fades_when_it_meets_none_and_returns_when_it_does():
+    w = flat_world()
+    fox = put(w, "fox", 20.5, 20.5)
+    fox.search_image = 1.0
+    for _ in range(1000):
+        fox.energy, fox.water = fox.max_energy, fox.max_water
+        fox.update(w)
+    assert fox.search_image < 0.6 and fox.search_image >= SEARCH_IMAGE_FLOOR
+    fox.x, fox.y = 20.5, 20.5
+    put(w, "rabbit", 21.5, 20.5)  # right under its nose: always noticeable
+    w._rebuild_buckets()
+    faded = fox.search_image
+    for _ in range(20):
+        if w.find_prey(fox):
+            break
+    assert fox.search_image > faded
+
+
+def test_super_animals_have_higher_ceilings_and_crowned_alphas():
+    from engine.config import RABBIT
+    s = supercharge(RABBIT)
+    assert s.traits["mass"].hi > RABBIT.traits["mass"].hi and s.traits["learning"].hi <= 0.95
+    w = small_world(seed=4, super_animals=True)
+    for _ in range(40):
+        w.step()
+    assert any(w.alphas)
+    a = w.by_id[next(i for al in w.alphas for i in al)]
+    assert w.inspect(a.id)["alpha"] in (1, 2, 3)
+    assert w.frame()["animals"][[x[0] for x in w.frame()["animals"]].index(a.id)][6] & 128
+
+
+def test_a_long_stride_cannot_hop_over_water():
+    w = flat_world(walls=[(21, 0, 22, 40)])  # a one-cell-wide stream at x = 21
+    rabbit = put(w, "rabbit", 20.4, 20.5)
+    for _ in range(50):
+        rabbit.x, rabbit.y = 20.4, 20.5
+        movement.step(rabbit, w, 0.0, 2.5, math.inf)
+        assert rabbit.x < 21.0
+
+
+# ---------------------------------------------------------------- the ledger, the AI analyst, settings
+
+import io  # noqa: E402
+import json  # noqa: E402
+import struct  # noqa: E402
+import urllib.error  # noqa: E402
+import zlib  # noqa: E402
+from collections import Counter  # noqa: E402
+
+from engine.animal import EMIGRATE_AFTER, TERRITORY_RETRY  # noqa: E402
+from engine.config import settings_of  # noqa: E402
+from engine.report import evidence, ledger_series  # noqa: E402
+
+
+def test_the_ledger_keeps_a_daily_diary_that_adds_up():
+    w = small_world(seed=2, end_on_extinction=False)
+    tpd = w.cfg.ticks_per_day
+    for _ in range(3 * tpd):
+        w.step()
+    rows = w.ledger.rows
+    assert [r["day"] for r in rows] == [0, 1, 2, 3]
+    for si in range(len(w.species)):
+        steps = [w.ledger.delta(b, a, si) for a, b in zip(rows, rows[1:])]
+        assert sum(d["births"] for d in steps) == w.births[si]
+        assert sum((d["deaths"] for d in steps), Counter()) == +w.deaths[si]
+        assert rows[-1]["species"][si]["n"] == w.counts()[si]
+    assert w.ledger.parent_traits[0][-1] == w.births[0]  # each young counts its parents once
+    assert w.ledger.dead_traits[0][:, -1].sum() == sum(w.deaths[0].values())
+
+
+def test_an_extinction_is_recorded_with_its_last_deaths_and_a_recolonisation():
+    w = small_world(seed=4, end_on_extinction=False, immigration=0)
+    foxes = [a for a in w.animals if a.si == 1]
+    for a in foxes:
+        w.kill(a, "removed")
+    w._flush()
+    w.step()
+    (ext,) = w.ledger.extinctions
+    assert ext["species"] == "fox" and len(ext["last_deaths"]) == len(foxes)
+    assert ext["last_deaths"][-1]["cause"] == "removed" and ext["recolonised_day"] is None
+    w.spawn(1, 30, 20, 2)
+    w.step()
+    assert ext["recolonised_day"] == w.env["day"]
+
+
+def test_sandbox_actions_are_logged_and_brush_strokes_merged():
+    w = flat_world()
+    a = w.paint(10, 10, 2, "water")
+    b = w.paint(13, 10, 2, "water")
+    painted = [x for x in w.ledger.actions if x["kind"] == "painted terrain"]
+    assert len(painted) == 1 and painted[0]["amount"] == a + b and painted[0]["detail"] == "water"
+    w.trigger("drought")
+    assert w.ledger.actions[-1]["kind"] == "event" and w.ledger.actions[-1]["detail"] == "drought"
+
+
+def test_the_ai_brief_covers_the_run_and_includes_a_map_picture():
+    w = small_world(seed=3, end_on_extinction=False, immigration=0)
+    for _ in range(2 * w.cfg.ticks_per_day):
+        w.step()
+    for a in [a for a in w.animals if a.si == 1]:
+        w.kill(a, "removed")
+    w._flush()
+    w.step()
+    brief = evidence(w, "extinction", "fox")
+    text = brief["text"]
+    for heading in ("## How this world works", "## Totals for the whole run", "## Timeline of the whole run",
+                    "## How they evolved", "foxes to die before the extinction", "## The map, by region",
+                    "## What the user did"):
+        assert heading in text, heading
+    assert brief["meta"]["focus"]["species"] == "fox" and brief["meta"]["extinctions"][0]["day"] == 3
+    png = brief["png"]
+    assert png[:8] == b"\x89PNG\r\n\x1a\n"
+    width, height = struct.unpack(">II", png[16:24])
+    assert (width, height) == (4 * w.width, 4 * w.height)
+    idat_len = struct.unpack(">I", png[33:37])[0]
+    assert len(zlib.decompress(png[41:41 + idat_len])) == height * (1 + 3 * width)
+    series = ledger_series(w)
+    assert len(series["tick"]) == len(w.ledger.rows) - 1
+    assert sum(series["species"]["rabbit"]["births"]) == w.births[0]
+
+
+def test_env_file_parsing_and_a_missing_key(tmp_path, monkeypatch):
+    import ai
+    f = tmp_path / ".env"
+    f.write_text('# comment\nANTHROPIC_API_KEY="sk-test"\nexport AI_MODEL=claude-x  # cheaper\nEMPTY=\n', encoding="utf-8")
+    assert ai.read_env(f) == {"ANTHROPIC_API_KEY": "sk-test", "AI_MODEL": "claude-x", "EMPTY": ""}
+    monkeypatch.setattr(ai, "ENV_PATH", f)
+    assert ai.settings()["key"] == "sk-test" and ai.settings()["model"] == "claude-x"
+    f.write_text("ANTHROPIC_API_KEY=\n", encoding="utf-8")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("AI_MODEL", raising=False)
+    assert ai.settings()["key"] == "" and ai.settings()["model"] == ai.DEFAULT_MODEL
+
+
+class _FakeResponse:
+    def __init__(self, lines):
+        self.lines = [line.encode() for line in lines]
+
+    def __iter__(self):
+        return iter(self.lines)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def test_the_ai_client_reads_claudes_streamed_answer(monkeypatch):
+    import ai
+    events = [
+        "event: message_start",
+        'data: {"type":"message_start","message":{"model":"claude-test","usage":{"input_tokens":1234}}}', "",
+        'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Foxes "}}',
+        'data: {"type":"ping"}',
+        'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"starved."}}',
+        'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}',
+        'data: {"type":"message_stop"}',
+    ]
+    seen = {}
+
+    def fake_urlopen(req, timeout):
+        seen.update(url=req.full_url, headers=dict(req.header_items()), body=json.loads(req.data))
+        return _FakeResponse(events)
+
+    monkeypatch.setattr(ai.urllib.request, "urlopen", fake_urlopen)
+    conf = {"key": "sk-test", "model": "claude-test", "base_url": "https://example.invalid"}
+    out = list(ai.stream(conf, "system", [{"role": "user", "content": "hi"}], 100))
+    assert "".join(v for k, v in out if k == "text") == "Foxes starved."
+    assert out[-1] == ("done", {"model": "claude-test", "input_tokens": 1234, "output_tokens": 5, "stop_reason": "end_turn"})
+    assert seen["url"] == "https://example.invalid/v1/messages" and seen["body"]["stream"] is True
+    assert seen["headers"]["X-api-key"] == "sk-test" and seen["headers"]["Anthropic-version"] == ai.API_VERSION
+
+    def rejected(req, timeout):
+        raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", {}, io.BytesIO(b'{"error":{"message":"invalid x-api-key"}}'))
+
+    monkeypatch.setattr(ai.urllib.request, "urlopen", rejected)
+    with pytest.raises(ai.AIError, match="rejected"):
+        list(ai.stream(conf, "system", [], 100))
+
+
+def test_the_ai_endpoint_streams_an_answer_and_reuses_it(monkeypatch):
+    import ai
+    import app as webapp
+    client = webapp.app.test_client()
+    client.post("/api/reset", json={"seed": 3, "settings": {"width": 64, "height": 40, "initial": {"rabbit": 30, "fox": 3}}})
+    for _ in range(5):
+        client.post("/api/step", json={"ticks": 60})
+    monkeypatch.setattr(ai, "settings", lambda: {"key": "", "model": "m", "base_url": "x"})
+    res = client.post("/api/ai", json={"kind": "summary"})
+    assert res.status_code == 400 and res.get_json()["setup"]
+
+    calls = []
+
+    def fake_analyse(conf, kind, brief, species=None, question=None, finished=False):
+        calls.append(kind)
+        yield "text", "Rabbits "
+        yield "text", "boomed."
+        yield "done", {"model": "claude-test", "stop_reason": "end_turn"}
+
+    monkeypatch.setattr(ai, "settings", lambda: {"key": "sk-test", "model": "claude-test", "base_url": "x"})
+    monkeypatch.setattr(ai, "analyse", fake_analyse)
+    lines = [json.loads(x) for x in client.post("/api/ai", json={"kind": "question", "question": "Why?"}).get_data(as_text=True).splitlines()]
+    assert "".join(x.get("text", "") for x in lines) == "Rabbits boomed." and lines[-1]["done"]
+    again = [json.loads(x) for x in client.post("/api/ai", json={"kind": "question", "question": "why?"}).get_data(as_text=True).splitlines()]
+    assert again[-1].get("cached") and calls == ["question"]
+    eid = lines[0]["meta"]["evidence"]
+    assert "## Timeline of the whole run" in client.get(f"/api/ai/evidence/{eid}.txt").get_data(as_text=True)
+    assert client.get(f"/api/ai/evidence/{eid}.png").data[:4] == b"\x89PNG"
+    assert client.post("/api/ai", json={"kind": "extinction", "species": "fox"}).status_code == 400
+    assert client.get("/api/ledger").get_json()["species"]["rabbit"]["n"]
+
+
+def test_emigration_can_be_switched_off():
+    for emigration in (True, False):
+        w = flat_world()
+        w.cfg = replace(w.cfg, emigration=emigration)
+        fox = put(w, "fox", 20.5, 20.5)
+        w._holders[fox.si].pop(fox.id, None)
+        fox.territorial, fox.natal, fox.helper_of = False, False, None
+        fox.failed_claims = EMIGRATE_AFTER
+        w.settle = lambda *args, **kw: False  # nowhere to settle
+        for _ in range(TERRITORY_RETRY + 2):
+            fox.energy, fox.water = fox.max_energy, fox.max_water
+            fox.update(w)
+            if not fox.alive:
+                break
+        assert (fox.cause == "emigrated") == emigration
+
+
+def test_super_animals_young_start_with_their_parents_know_how():
+    w = small_world(seed=5, super_animals=True, inherit_learning=0.5, initial={"rabbit": 0, "fox": 0}, immigration=0)
+    assert w.teaching and not small_world(seed=5).teaching
+    ids = w.spawn(0, 30, 20, 8)
+    mother = next(w.by_id[i] for i in ids if w.by_id[i].female)
+    father = next(w.by_id[i] for i in ids if not w.by_id[i].female)
+    table = w.brains[0]
+    table.w1[mother.brain_row] += 0.1  # what she has learned in life
+    mother.experience = 0.8
+    w.mate(mother, father)
+    mother.energy = mother.max_energy
+    w.give_birth(mother)
+    w._flush()
+    young = [w.by_id[i] for i in mother.children_ids if i in w.by_id]
+    assert young
+    for y in young:
+        # Half of the parents' average know-how (hers +0.1, his 0) is built into the wiring it starts with.
+        assert np.allclose(table.c1[y.brain_row], 0.025, atol=1e-6)
+        assert np.allclose(table.w1[y.brain_row], table.i1[y.brain_row])
+        assert y.experience == pytest.approx(0.4)
+
+
+def test_map_size_is_a_setting_with_safe_limits():
+    cfg = build_config({"width": 10, "height": 999})
+    assert (cfg.width, cfg.height) == (40, 160)
+    w = World(build_config({"width": 48, "height": 32, "initial": {"rabbit": 16, "fox": 2}}), seed=1)
+    for _ in range(100):
+        w.step()
+    assert w.terrain.types.shape == (32, 48) and settings_of(w.cfg)["width"] == 48
+
+
+def test_the_urge_to_mate_builds_in_season_is_sated_by_mating_and_fades_in_pregnancy():
+    from engine.animal import REWARD_MATING
+    w = small_world(seed=5, initial={"rabbit": 0, "fox": 0}, immigration=0)
+    assert w.in_season[0]  # rabbits breed from the start of spring
+    (fid,) = w.spawn(0, 30, 20, 1)
+    female = w.by_id[fid]
+    if not female.female:
+        female.female = True
+    for _ in range(200):  # alone, so she can't mate: the urge builds
+        female.energy, female.water = female.max_energy, female.max_water
+        female.update(w)
+    assert female.urge > 0.6
+    # It is felt, but costs the body nothing: her reserves were only topped up, never drained by it.
+    w._rebuild_buckets()
+    female.sense(w)
+    male = w.by_id[w.spawn(0, 30.5, 20, 1)[0]]
+    male.female = False
+    w.mate(female, male)
+    assert female.urge == 0.0 and male.urge == 0.0
+    female.sense(w)
+    assert female.reward > REWARD_MATING  # the pleasure of mating plus relief from the urge
+    female.urge = 0.8
+    for _ in range(80):  # pregnant now: the hormones fall and the urge fades (half-life about 35 ticks)
+        female.energy, female.water = female.max_energy, female.max_water
+        female.update(w)
+    assert female.pregnant and female.urge < 0.2
+
+
+# ---------------------------------------------------------------- climates, camouflage and the winter moult
+
+from engine.climate import BIOMES, CLIMATES  # noqa: E402
+from engine.coats import WINTER_LUM  # noqa: E402
+from engine.terrain import SAND, WALKABLE  # noqa: E402
+
+
+def climate_world(name, seed=3, **settings):
+    cfg = build_config({"climate": name, "width": 64, "height": 40, "initial": {"rabbit": 20, "fox": 2}, **settings})
+    return World(cfg, seed=seed)
+
+
+def test_a_temperate_map_is_the_same_everywhere():
+    w = climate_world("temperate")
+    assert w.climate.uniform and not w.climate.offset.any()
+    assert w.climate.growth(0.7, -0.5, 0) == 0.7  # plain seasonal growth, no per-cell field
+    assert w.cold_heat(10, 10) == (w.cold, w.heat)
+
+
+def test_climates_set_snow_and_heat_where_they_should():
+    arctic, desert = climate_world("arctic"), climate_world("desert")
+    assert arctic.climate.snow_at(-1.0, 30, 20) > 0.9  # deep winter snow
+    assert arctic.climate.snow_at(1.0, 30, 20) == 0.0  # but a snow-free summer
+    assert desert.climate.snow_at(-1.0, 30, 20) < 0.3  # too warm and dry for much snow
+    assert desert.climate.temperature(1.0, 30, 20) > 1.4  # a scorching summer
+    land = WALKABLE[desert.terrain.types]
+    sand = (desert.terrain.types == SAND)[land].mean()
+    assert 0.5 < sand < 0.9  # mostly sand, with patches of scrub to graze
+
+
+def test_a_mixed_map_runs_from_cold_north_to_hot_dry_south():
+    w = climate_world("mixed", width=120, height=80)
+    off, dry = w.climate.offset, w.climate.dry
+    assert off[:10].mean() < off[-10:].mean() - 1.0
+    assert dry[-10:].mean() > dry[:10].mean() + 0.6
+    found = set(BIOMES[k] for k in np.unique(w.climate.biomes(w.terrain)))
+    assert {"tundra", "desert"} <= found
+
+
+def test_climates_bring_their_landscape_unless_told_otherwise():
+    assert build_config({"climate": "desert"}).water_fraction == CLIMATES["desert"]["terrain"]["water"] / 100
+    assert build_config({"climate": "desert", "water_fraction": 0.2}).water_fraction == 0.2
+    assert build_config({"climate": "volcano"}).climate == "temperate"
+
+
+def test_camouflage_depends_on_coat_against_the_ground_under_the_animal():
+    from engine.terrain import FOREST
+    w = climate_world("arctic", initial={"rabbit": 0, "fox": 0}, immigration=0)
+    w.light, w.moult = 1.0, 0.0
+    rabbit = w.by_id[w.spawn(0, 30, 20, 1)[0]]
+    rabbit.moults, rabbit.last_move = False, 0.0
+    coat = {c.name: i for i, c in enumerate(w.genomes[0].coats)}
+    cx, cy = int(rabbit.x), int(rabbit.y)
+
+    def seen(name, kind=GRASS, temp=1.0, brown=0.0):
+        rabbit.coat = coat[name]
+        w.terrain.types[cy, cx] = kind
+        w.veg.B[cy, cx] = w.veg.K[cy, cx]
+        w.season_temp, w.grass_brown = temp, brown
+        return w.visibility(rabbit)
+
+    # Snow hides white and shows up dark; summer grass hides the wild agouti best;
+    # dark leaf litter hides black.
+    assert seen("Albino", temp=-1.0) < seen("Chestnut agouti", temp=-1.0) < seen("Black", temp=-1.0)
+    assert seen("Chestnut agouti") < min(seen("Black"), seen("Albino"))
+    assert seen("Black", FOREST) < seen("Chestnut agouti", FOREST) < seen("Albino", FOREST)
+    # Moving gives it away; in the dark colour hardly matters.
+    still = seen("Chestnut agouti")
+    rabbit.last_move = rabbit.speed
+    assert w.visibility(rabbit) > still
+    rabbit.last_move, w.light = 0.0, 0.0
+    assert w.visibility(rabbit) == pytest.approx(1.0)
+
+
+def test_foxes_and_rabbits_see_an_orange_fox_much_like_green_grass():
+    # Dichromats: orange and green differ mostly in lightness to them, so a red fox
+    # is far better hidden in grass than a white or a black animal would be.
+    from engine.coats import tone
+    from engine.world import CHROMA, GROUND
+    import math
+    gap = lambda c: math.hypot(tone(c)[0] - GROUND["lush"][0], CHROMA * (tone(c)[1] - GROUND["lush"][1]))  # noqa: E731
+    red, black, white = gap("#d9622b"), gap("#2b2727"), gap("#f4f1ea")
+    assert red < 0.2 and red < black < white
+
+
+def test_winter_white_animals_moult_by_day_length():
+    w = climate_world("arctic", initial={"rabbit": 0, "fox": 0}, immigration=0)
+    gs = w.genomes[0]
+    rabbit = w.by_id[w.spawn(0, 30, 20, 1, "Winter white")[0]]
+    assert rabbit.moults and not w.by_id[w.spawn(0, 30, 20, 1, "Wild type")[0]].moults
+    w.moult = 1.0
+    assert w.coat_lum_now(rabbit) == pytest.approx(WINTER_LUM)
+    w.moult = 0.0
+    assert w.coat_lum_now(rabbit) == pytest.approx(gs.coats[rabbit.coat].lum)
+    tpd, dpy = w.cfg.ticks_per_day, w.cfg.days_per_year
+    w.tick = int(10.5 * tpd)  # midwinter
+    w._environment()
+    assert w.env["moult"] > 0.99
+    w.tick = int(4.5 * tpd)  # midsummer
+    w._environment()
+    assert w.env["moult"] == 0.0
+
+
+def test_the_cold_costs_more_in_the_arctic_than_in_a_temperate_winter():
+    costs = []
+    for name in ("temperate", "arctic"):
+        w = climate_world(name, initial={"rabbit": 0, "fox": 0}, immigration=0)
+        rabbit = w.by_id[w.spawn(0, 30, 20, 1)[0]]
+        rabbit.concealed = False
+        w.season_temp, w.cold, w.heat = -0.5, 0.5, 0.0
+        costs.append(rabbit.thermal_cost(w))
+    assert costs[1] > costs[0] > 1.0

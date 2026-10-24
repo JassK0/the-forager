@@ -10,6 +10,14 @@ white-marking allele, which is lethal when homozygous.
 A coat's mean luminance sets how well it matches the background, so coat
 colour is under natural selection: dark coats stand out on snow, white coats
 on summer grass.
+
+How the animals see colour. Foxes and rabbits are dichromats: like a person
+with red-green colour blindness, they have only two kinds of cone, and tell
+colours apart by lightness and along a yellow-blue axis (Jacobs 1993; Jacobs
+et al. 1993 for the fox). So to them an orange fox and green grass differ
+little, which is why a red fox is camouflaged from its prey. `luminance` is
+the lightness (sRGB luma, roughly perceptual lightness) and `yellow_blue` the
+yellow-blue opponent signal.
 """
 
 from dataclasses import dataclass, field
@@ -42,6 +50,18 @@ def mix(a: str, b: str, t: float) -> str:
 def luminance(c: str) -> float:
     r, g, b = _rgb(c)
     return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255
+
+
+def yellow_blue(c: str) -> float:
+    """How yellow (+) or blue (-) a colour looks to a dichromat: long/middle-wave
+    cones against short-wave ones."""
+    r, g, b = _rgb(c)
+    return ((r + g) / 2 - b) / 255
+
+
+def tone(c: str) -> tuple[float, float]:
+    """A colour as a dichromat sees it: (lightness, yellow-blue)."""
+    return luminance(c), yellow_blue(c)
 
 
 def _dominant(alleles: tuple[str, ...], pair: tuple[str, str]) -> str:
@@ -139,6 +159,21 @@ def fox_coat(g: dict[str, tuple[str, str]]) -> Coat:
 
 COAT_MODELS = {"rabbit": rabbit_coat, "fox": fox_coat}
 
+# Seasonal moult to a white winter coat (the moult itself is timed by day length
+# in world.py). Dominant in hares, recessive in Arctic foxes.
+WINTER_WHITE = "#f1f3f6"
+WINTER_LUM = luminance(WINTER_WHITE)
+WINTER_YB = yellow_blue(WINTER_WHITE)
+
+
+def coat_tone(coat: Coat) -> tuple[float, float]:
+    """The coat's lightness (weighted over its parts) and the yellow-blue of its body."""
+    return coat.lum, yellow_blue(coat.colors["body"])
+MOULTS = {
+    "rabbit": lambda g: "M" in g.get("Mo", ()),
+    "fox": lambda g: g.get("Mo", ("Mo", "Mo")).count("mo") == 2,
+}
+
 PRESETS = {
     "rabbit": {
         "Wild type": {},
@@ -151,6 +186,7 @@ PRESETS = {
         "Albino": {"C": ("c", "c")},
         "Broken": {"En": ("En", "en")},
         "Opal": {"D": ("d", "d")},
+        "Winter white": {"Mo": ("M", "M")},
     },
     "fox": {
         "Red": {},

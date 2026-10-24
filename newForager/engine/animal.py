@@ -57,6 +57,8 @@ import math
 from enum import IntEnum
 
 from . import brain, movement
+from .coats import MOULTS
+from .rodents import MOUSE_SUCCESS, VOLE_ENERGY, VOLE_HALF
 
 LN2 = math.log(2.0)
 GOMPERTZ_SHAPE = 5.0  # larger = senescent deaths more tightly clustered around the lifespan
@@ -84,7 +86,17 @@ DANGER_MEMORY_DAYS = 1.0  # half-life of a remembered scare
 MEMORY_SIZE = 32  # places remembered per map; the faintest memory is forgotten first
 RECALL = 0.2  # remembered value worth travelling back for
 # Rewards for lifetime learning (on top of the homeostatic reward of meeting needs).
-REWARD_MATING = 0.4  # x mating drive
+REWARD_MATING = 0.4  # x mating drive: the pleasure of mating itself
+# The urge to mate. Breeding hormones (testosterone, oestrogen), switched on by
+# day length in the breeding season, make an adult breeder increasingly
+# restless to mate, more so with a high mating-drive gene. Mating sates it, and
+# it fades in pregnancy and out of season. It is felt (it counts in the
+# homeostatic drive, so meeting it is rewarding) but, unlike hunger, it does
+# the body no harm. Sexual motivation in mammals: Pfaus 2009; seasonal
+# breeding in red foxes: Lloyd & Englund 1973.
+URGE_RISE = 0.006  # per tick at mating drive 1: half-way in about half a day of breeding condition
+URGE_FADE = 0.98  # per tick once the hormones fall (pregnancy, end of season): half-life about 35 ticks
+URGE_WEIGHT = 0.8  # a full urge weighs like 80% hunger, so pressing survival needs still come first
 DRIVE_N, DRIVE_M = 4.0, 3.0  # exponents of the homeostatic drive
 PAIN_LUNGE = 1.0  # a predator's lunge that just missed
 FEAR_COST = 0.03  # per tick, x threat, while a predator is in sight
@@ -111,7 +123,27 @@ HUDDLE = 0.3  # each extra body in the burrow cuts the remaining cold cost
 PLANT_WATER = 12.0  # water per unit of fresh plant biomass eaten
 MEAT_WATER = 0.25  # water per unit of energy eaten as meat
 
-BIRTH_MASS = 0.08  # newborn mass as a fraction of adult mass
+BIRTH_MASS = 0.08  # newborn mass as a fraction of adult mass (at an average gestation length)
+VISION_FLOOR = 0.3  # a blind newborn still senses by touch and smell at arm's length
+
+# Injuries from fights and from predators' near misses: they slow the animal,
+# make it a worse hunter and a less attractive mate, cost energy to heal, and
+# now and then leave a permanent limp.
+INJURY_SLOW = 0.5  # speed (and catching ability) lost at full injury
+HEALING_COST = 0.3  # extra upkeep at full injury
+HEAL_RATE = 4e-4  # per tick: a moderate injury heals in about three days
+LAME_CHANCE = 0.25  # chance a severe injury (over 0.6) leaves a permanent limp
+LAME_LEVEL = 0.25
+MAX_INJURY = 0.9
+CLUMSY = 0.5  # hunting skill below which a young fox fills up on fruit before trying to hunt
+
+# Search image (Tinbergen 1960): a predator that has met a prey type recently is
+# quicker to notice it. Where rabbits are rare the image fades, foxes notice
+# them less and turn to voles, so predation eases on scarce prey (a type III
+# functional response, as found for foxes and rabbits by Pech et al. 1995).
+SEARCH_IMAGE_FLOOR = 0.4  # never below this: foxes still notice rabbits, just less
+SEARCH_IMAGE_GAIN = 0.3  # strengthening each time it notices one
+SEARCH_IMAGE_DECAY = 0.5 ** (1.0 / 240)  # fading towards the floor: half-life of a day
 WEANING_MASS = 0.35  # mass at weaning
 GROWTH_COST = 0.2  # energy spent building each unit of new tissue, x its stored energy
 # The calendar compresses growth about 30x (a fox cub is weaned in a day, not
@@ -204,14 +236,16 @@ class Animal:
         "act", "target", "best_d", "stall", "ignore", "ignore_until", "search_cd",
         "threats", "ars", "rest_left", "stun", "carcass",
         "pregnant", "gestation_left", "mate_genome", "mate_traits", "mate_genotype", "mate_id", "mate_generation",
+        "mate_know",
         "refractory", "partner", "nest_x", "nest_y", "litter", "next_nurse", "nursing",
         "fear", "alert_until", "scanning", "stalking", "group", "group_t", "flee_until", "chase_until",
         "carried", "cache_den", "dest", "concealed", "surplus", "path", "path_goal", "path_t", "route",
-        "brain_row", "planned", "rule_choice", "inputs", "mask", "scores", "hidden", "spotted", "threat", "charging",
+        "brain_row", "planned", "rule_choice", "inputs", "mask", "think_k", "spotted", "threat", "charging",
         "food_mem", "danger_mem", "experience", "skill", "goal",
         "children", "kills", "failed_claims", "prey_idx", "predator_idx", "helper_of", "natal",
         "reward", "reward_events", "prev_drive", "surprise", "value_now", "wellbeing", "surprise_avg",
         "recent", "brain_log", "rewards_total",
+        "injury", "lame", "base_speed", "birth_frac", "marks", "search_image", "urge", "moults",
     )
 
     def __init__(self, world, uid, si, genome, expr, x, y, *, age=0, generation=0,
@@ -227,6 +261,7 @@ class Animal:
         self.genotype = expr.genotype
         self.coat = expr.coat
         self.coat_lum = world.genomes[si].coats[expr.coat].lum
+        self.moults = MOULTS[sp.coat](expr.genotype)  # turns white in winter
         self.vigor = expr.vigor
         self.load = expr.load
         self.load_hom = expr.load_hom
@@ -247,7 +282,7 @@ class Animal:
         q = (self.traits["mass"] / sp.ref_mass) ** 0.25
         self.lifespan = sp.lifespan * q
         self.maturity = sp.maturity * q
-        self.gestation = sp.gestation * q
+        self.gestation = sp.gestation * q * self.traits.get("gestation", 1.0)
         self.weaning = sp.weaning * q
         self.mother = None  # set while the animal is a dependent, nursing juvenile
         # Territorial species breed only once they hold a territory (Brown 1969).
@@ -262,6 +297,12 @@ class Animal:
         self.alive = True
         self.cause = None
         self.vision = self.traits["vision"]
+        self.injury = 0.0
+        self.lame = 0.0  # a permanent limp from an old injury
+        self.birth_frac = BIRTH_MASS
+        self.marks = []  # recent scent marks (x, y, tick)
+        self.search_image = 1.0  # how tuned in it is to its prey (predators only)
+        self.urge = 0.0  # hormonal urge to mate, 0-1 (see URGE_RISE)
         self.max_stamina = self.traits.get("stamina", sp.stamina)
         self._allometry()
         self.energy = 0.8 * self.max_energy
@@ -287,6 +328,7 @@ class Animal:
         self.mate_traits = None
         self.mate_genotype = None
         self.mate_id = None
+        self.mate_know = None  # super animals mode: the father's know-how, passed to the young
         self.mate_generation = 0
         self.refractory = 0.0
         self.partner = None
@@ -317,8 +359,7 @@ class Animal:
         self.rule_choice = None
         self.inputs = None
         self.mask = None
-        self.scores = None
-        self.hidden = None
+        self.think_k = -1  # this animal's row in its species' latest batch of decisions
         self.spotted = False
         self.threat = 0.0
         self.charging = False
@@ -354,7 +395,7 @@ class Animal:
         if self.adult:
             return 1.0
         if self.age < self.weaning:
-            return BIRTH_MASS + (WEANING_MASS - BIRTH_MASS) * self.age / self.weaning
+            return self.birth_frac + (WEANING_MASS - self.birth_frac) * self.age / self.weaning
         return WEANING_MASS + (1 - WEANING_MASS) * (self.age - self.weaning) / max(1.0, self.maturity - self.weaning)
 
     def _allometry(self) -> None:
@@ -389,22 +430,45 @@ class Animal:
         self.water_loss = sp.water_loss * m75
         self.intake = sp.intake * m75
         # Maximum sprint speed scales roughly as M^0.17 (Garland 1983).
-        self.speed = t["speed"] * frac ** 0.17
+        self.base_speed = t["speed"] * frac ** 0.17
+        self.speed = self.base_speed * (1.0 - INJURY_SLOW * self.injury)
+        # Newborns are blind; once the eyes open, sight develops until weaning.
+        self.vision = max(VISION_FLOOR, t["vision"] * self.sight())
+
+    def sight(self) -> float:
+        """How well the eyes work, from 0 (closed) to 1."""
+        if self.adult or self.age >= self.weaning:
+            return 1.0
+        opened = self.sp.eyes_open * self.weaning
+        if self.age < opened:
+            return 0.0
+        return (self.age - opened) / max(1.0, self.weaning - opened)
+
+    def hurt(self, w, amount: float) -> None:
+        """An injury: painful, slowing, and occasionally permanent."""
+        if amount <= 0.0:
+            return
+        self.injury = min(MAX_INJURY, self.injury + amount)
+        self.reward_events -= amount
+        if self.injury >= 0.6 and w.rng.random() < LAME_CHANCE:
+            self.lame = max(self.lame, LAME_LEVEL)
+        self.speed = self.base_speed * (1.0 - INJURY_SLOW * self.injury)
+
+    def in_breeding_state(self, w) -> bool:
+        """Hormonally primed to breed: an adult breeder in the breeding season,
+        not pregnant and not just after mating (body condition aside)."""
+        return self.adult and self.territorial and not self.pregnant and self.refractory <= 0 and w.in_season[self.si]
 
     def ready_to_mate(self, w) -> bool:
         return (
-            self.adult
-            and self.territorial
-            and not self.pregnant
-            and self.refractory <= 0
-            and w.in_season[self.si]
+            self.in_breeding_state(w)
             and self.energy > CONDITION * self.max_energy
             and self.water > CONDITION * self.max_water
         )
 
     def thermal_cost(self, w) -> float:
         ins = self.traits["insulation"]
-        cold, heat = w.cold, w.heat
+        cold, heat = w.cold_heat(self.x, self.y)
         if self.concealed:
             # Underground: buffered from the weather and warmed by burrow-mates.
             mates = w.huddle.get((int(self.x), int(self.y)), 1)
@@ -427,10 +491,17 @@ class Animal:
                 self._allometry()
 
         burn = self.upkeep * self.thermal_cost(w)
+        if self.injury > 0.0:
+            burn *= 1.0 + HEALING_COST * self.injury  # healing takes energy
+            if self.injury > self.lame:
+                self.injury = max(self.lame, self.injury - HEAL_RATE)
+                if self.age % 10 == 0:
+                    self.speed = self.base_speed * (1.0 - INJURY_SLOW * self.injury)
         if self.pregnant:
             burn *= sp.gestation_cost
         self.energy -= burn
-        self.water -= self.water_loss * (1.0 + 0.5 * w.heat * (BURROW_HEAT if self.concealed else 1.0))
+        heat = w.cold_heat(self.x, self.y)[1]
+        self.water -= self.water_loss * (1.0 + 0.5 * heat * (BURROW_HEAT if self.concealed else 1.0))
         if self.energy <= 0.0:
             w.kill(self, "starvation")
             return
@@ -461,6 +532,8 @@ class Animal:
                 if self.act == Act.NEST:
                     self.concealed = False
                     self._switch(Act.WANDER)
+        elif self.territorial and sp.territory > 0 and not self.female and self.age % TERRITORY_RETRY == 0:
+            w.pair_up(self)  # a lone male moves in with a lone vixen nearby
         elif self.adult and not self.territorial and self.age % TERRITORY_RETRY == 0:
             if self.natal:
                 if w.dispersal_time(self.si):
@@ -468,12 +541,12 @@ class Animal:
             elif self.helper_of is not None:
                 if not self.helper_of.alive or not self.helper_of.territorial:
                     self.helper_of = None  # her family broke up: she becomes a floater
-            # Floaters keep prospecting for a vacancy or a lone mate's territory;
-            # if the whole neighbourhood stays full they leave the area, so
-            # territories cap the local density.
-            elif not w.settle(self, 2.0 * sp.dispersal):
+            # Floaters keep prospecting for a vacancy or a lone mate's territory
+            # (after a first failure, anywhere in the area); only if there is
+            # none at all do they leave, so territories cap the local density.
+            elif not w.settle(self, 2.0 * sp.dispersal, anywhere=self.failed_claims > 0):
                 self.failed_claims += 1
-                if self.failed_claims >= EMIGRATE_AFTER:
+                if self.failed_claims >= EMIGRATE_AFTER and w.cfg.emigration:
                     w.kill(self, "emigrated")
                     return
         if self.pregnant:
@@ -482,8 +555,14 @@ class Animal:
                 w.give_birth(self)
         if self.refractory > 0:
             self.refractory -= 1
+        if self.in_breeding_state(w):
+            self.urge += URGE_RISE * self.traits.get("libido", 1.0) * (1.0 - self.urge)
+        elif self.urge > 0.0:
+            self.urge = self.urge * URGE_FADE if self.urge > 0.001 else 0.0
         if self.ars > 0:
             self.ars -= 1
+        if self.prey_idx and self.search_image > SEARCH_IMAGE_FLOOR:
+            self.search_image = SEARCH_IMAGE_FLOOR + (self.search_image - SEARCH_IMAGE_FLOOR) * SEARCH_IMAGE_DECAY
         if self.fear > 0.01:
             self.fear *= FEAR_DECAY
         if self.stamina < self.max_stamina:
@@ -650,7 +729,9 @@ class Animal:
         self.threat = 0.0
         self.charging = False
         if self.predator_idx and not self.concealed and self.mother is None:
-            threats = w.query(self.predator_idx, self.x, self.y, self.vision)
+            # Only look properly if a predator could be within sight at all.
+            key = (int(self.x) >> 3) + (int(self.y) >> 3) * w._nbx
+            threats = w.query(self.predator_idx, self.x, self.y, self.vision) if key in w.danger_zone[self.si] else ()
             if threats:
                 alerted = self.act in (Act.FLEE, Act.FREEZE, Act.ALERT) or self.alert_until > w.tick
                 if alerted or self._spots(w, threats):
@@ -671,32 +752,35 @@ class Animal:
             elif self.act == Act.FLEE and self.flee_until <= w.tick:
                 self.gain_experience(1.0)  # got away: a lesson learned
 
+        tick = w.tick
+        traits = self.traits
+        x, y = self.x, self.y
         hunger = 1.0 - self.energy / self.max_energy
         thirst = 1.0 - self.water / self.max_water
-        here = self.region(w)
+        here = int(x) // REGION + (int(y) // REGION) * w.region_cols
         if sp.diet == "plants":
-            food = float(w.veg.B[int(self.y), int(self.x)]) / w.veg.capacity
+            food = float(w.veg.B[int(y), int(x)]) / w.veg.capacity
         else:
             food = self.recall(w, self.food_mem, here, FOOD_MEMORY_DAYS)
-        if w.tick >= self.group_t:
-            self.group = len(w.query((self.si,), self.x, self.y, 3.0, exclude=self))
-            self.group_t = w.tick + 10
+        if tick >= self.group_t:
+            self.group = len(w.query((self.si,), x, y, 3.0, exclude=self))
+            self.group_t = tick + 10
         ready = self.ready_to_mate(w)
-        alarm = self.alert_until > w.tick
+        alarm = self.alert_until > tick
         self.inputs = [
-            min(1.5, hunger * self.traits.get("appetite", 1.0)),
+            min(1.5, hunger * traits.get("appetite", 1.0)),
             thirst,
-            self.traits.get("libido", 1.0) if ready else 0.0,
+            traits.get("libido", 1.0) * (0.5 + self.urge) if ready else 0.0,  # how aroused it feels
             self.threat,
             1.0 if self.charging else 0.0,
             1.0 if alarm else 0.0,
             self.fear,
-            self.recall(w, self.danger_mem, here, DANGER_MEMORY_DAYS),
+            self.recall(w, self.danger_mem, here, DANGER_MEMORY_DAYS) if self.danger_mem else 0.0,
             min(1.0, food),
-            min(2.0, math.hypot(self.home_x - self.x, self.home_y - self.y) / sp.home_radius),
+            min(2.0, math.hypot(self.home_x - x, self.home_y - y) / sp.home_radius),
             w.light,
             1.0 if w.resting[self.si] else 0.0,
-            self.traits.get("freeze", 0.0),
+            traits.get("freeze", 0.0),
             min(self.group, 8) / 8.0,
             0.0 if self.adult else 1.0,
         ]
@@ -715,16 +799,18 @@ class Animal:
         # Reward since the last decision: needs met (drive reduced), plus pleasure
         # and pain from events, plus the unpleasantness of a predator in sight.
         # Homeostatic drive (Keramati & Gutkin 2014): D = (sum deficit^n)^(1/m), n > m,
-        # so an urgent need dominates and meeting it is the most rewarding.
+        # so an urgent need dominates and meeting it is the most rewarding. The urge
+        # to mate counts too, so while it is strong, food matters a little less.
         h, t = min(1.0, max(0.0, hunger)), min(1.0, max(0.0, thirst))
-        drive = (h ** DRIVE_N + t ** DRIVE_N) ** (1.0 / DRIVE_M)
+        u = URGE_WEIGHT * self.urge
+        drive = (h ** DRIVE_N + t ** DRIVE_N + u ** DRIVE_N) ** (1.0 / DRIVE_M)
         r = (self.prev_drive - drive) if self.prev_drive is not None else 0.0
         r += self.reward_events - FEAR_COST * self.threat
         self.prev_drive = drive
         self.reward_events = 0.0
         self.reward = r
         self.rewards_total += r
-        if (w.tick + self.id) % 10 == 0:
+        if (tick + self.id) % 10 == 0:
             self.recent.append((self.inputs + [1.0], self.mask))
             if len(self.recent) > RECENT_SITUATIONS:
                 del self.recent[0]
@@ -843,7 +929,7 @@ class Animal:
                 if not a.adult or a.female != self.female or a is self.partner or a.mother_id == self.id \
                         or a.natal or a.helper_of is self:
                     continue  # family is tolerated
-                trespassing = not a.territorial or math.hypot(a.home_x - self.home_x, a.home_y - self.home_y) >= sp.territory
+                trespassing = not a.territorial or (a.home_x, a.home_y) != (self.home_x, self.home_y)
                 if trespassing and math.hypot(a.x - self.home_x, a.y - self.home_y) < core \
                         and a.act != Act.CHASE and w.rng.random() < DEFEND_CHANCE:
                     self._switch(Act.CHASE)
@@ -853,6 +939,9 @@ class Animal:
                     return True
         d_home = math.hypot(self.home_x - self.x, self.home_y - self.y)
         if self.act == Act.WANDER and 0.5 * core < d_home < 1.1 * core and w.rng.random() < MARK_CHANCE:
+            self.marks.append((round(self.x, 1), round(self.y, 1), w.tick))
+            if len(self.marks) > 16:
+                del self.marks[0]
             self._switch(Act.MARK)
             self.rest_left = 3
             return True
@@ -1096,7 +1185,8 @@ class Animal:
         self.energy += bite * per_biomass
         self.learn(w, self.food_mem, self.region(w), min(1.0, b / w.veg.capacity), FOOD_MEMORY_DAYS, 0.3)
         # Fresh green plants are mostly water; dry winter forage much less so.
-        self.water = min(self.max_water, self.water + bite * PLANT_WATER * w.forage_moisture)
+        moisture = w.forage_moisture * w.climate.moisture_at(self.x, self.y)  # dry country, dry forage
+        self.water = min(self.max_water, self.water + bite * PLANT_WATER * moisture)
         if self.energy >= SATED * self.max_energy:
             self._switch(Act.WANDER)
             self.ars = sp.ars_duration
@@ -1168,6 +1258,9 @@ class Animal:
     def _hunt(self, w) -> None:
         sp = self.sp
         prey = self.target
+        if isinstance(prey, tuple):
+            self._pick_fruit(w, prey)
+            return
         if isinstance(prey, Carrion):
             if prey.energy > 0.0:
                 self._scavenge(w, prey)
@@ -1191,9 +1284,19 @@ class Animal:
                     self._set_target(food)
                     self._scavenge(w, food)
                     return
+                fruit = w.find_fruit(self) if sp.eats_fruit else None
+                if fruit is not None and self.skill < CLUMSY:
+                    # Inexperienced hunters fill up on easy food first.
+                    self._set_target(fruit)
+                    self._pick_fruit(w, fruit)
+                    return
                 if self.stamina >= HUNT_STAMINA * self.max_stamina:
                     found = w.find_prey(self)
                     prey = found[0] if found else None
+                if prey is None and fruit is not None:
+                    self._set_target(fruit)
+                    self._pick_fruit(w, fruit)
+                    return
                 if prey is None:
                     self.search_cd = 2
                     self.learn(w, self.food_mem, self.region(w), 0.0, FOOD_MEMORY_DAYS, 0.2)
@@ -1207,7 +1310,10 @@ class Animal:
             self._reconsider(w, prey)
             prey = self.target
         if prey is None:
-            # No prey in sight: return to a remembered hunting ground, else search.
+            # No prey in sight: listen for voles here, else go back to a
+            # remembered hunting ground, else search.
+            if sp.eats_voles and self._mouse(w):
+                return
             if not self._go_to_remembered(w, self.food_mem):
                 self._range(w, sp.cruise)
             return
@@ -1219,7 +1325,7 @@ class Animal:
             w.pounce(self)
             self.skill += 0.3 * self.traits.get("learning", 0.25) * (1.0 - self.skill)
             # Young foxes are clumsy hunters and improve with practice.
-            if w.rng.random() < sp.capture_success * (0.75 + 0.25 * self.skill):
+            if w.rng.random() < sp.capture_success * (0.75 + 0.25 * self.skill) * (1.0 - INJURY_SLOW * self.injury):
                 self.skill += self.traits.get("learning", 0.25) * (1.0 - self.skill)
                 self.learn(w, self.food_mem, self.region(w), 1.0, FOOD_MEMORY_DAYS)
                 self.carcass = prey.mass * prey.sp.carcass_energy
@@ -1232,6 +1338,8 @@ class Animal:
             else:
                 w.hunts[self.si]["missed lunge"] += 1
                 prey.reward_events -= PAIN_LUNGE
+                if w.rng.random() < 0.3:
+                    prey.hurt(w, w.rng.uniform(0.1, 0.4))  # bitten, but got away
                 self.stun = LUNGE_RECOVERY
                 self.stamina = max(0.0, self.stamina - 5.0)
             self.last_move = 0.0
@@ -1277,6 +1385,49 @@ class Animal:
         tx = prey.x + math.cos(prey.heading) * lead
         ty = prey.y + math.sin(prey.heading) * lead
         self._move(w, math.atan2(ty - self.y, tx - self.x), pace, DIRECTED_KAPPA, sprint=rush)
+
+    def _mouse(self, w) -> bool:
+        """Mousing: walk slowly through the grass listening for voles, then pounce.
+        Returns False where there are too few voles to be worth it."""
+        cx, cy = int(self.x), int(self.y)
+        V = w.voles.V
+        v = float(V[cy, cx])
+        if v < 0.3:
+            return False
+        if w.rng.random() < MOUSE_SUCCESS * v / (v + VOLE_HALF) * (1.0 - INJURY_SLOW * self.injury):
+            V[cy, cx] = max(0.0, v - 1.0)
+            w.pounce(self)
+            self.carcass = VOLE_ENERGY
+            self.act = Act.EAT
+            self.last_move = 0.0
+            w.hunts[self.si]["vole"] += 1
+            self.learn(w, self.food_mem, self.region(w), 0.5, FOOD_MEMORY_DAYS, 0.3)
+            return True
+        self._range(w, self.sp.cruise * 0.4)  # creeping, head down, ears forward
+        return True
+
+    def _pick_fruit(self, w, cell) -> None:
+        """Walk to a fruiting bush and eat what is ripe, up to a full stomach."""
+        cx, cy = cell
+        F = w.fruit.F
+        if F[cy, cx] < 1.0:
+            self._set_target(None)
+            return
+        tx, ty = cx + 0.5, cy + 0.5
+        if math.hypot(tx - self.x, ty - self.y) < 0.8:
+            room = max(0.0, self.max_energy - self.energy) / self.sp.assimilation
+            take = min(float(F[cy, cx]), room)
+            F[cy, cx] -= take
+            self.carcass = take
+            self.act = Act.EAT
+            self.target = None
+            self.last_move = 0.0
+            w.hunts[self.si]["fruit"] += 1
+            self.learn(w, self.food_mem, self.region(w), 0.6, FOOD_MEMORY_DAYS)
+            return
+        self.goal = None
+        if not self._approach(w, tx, ty, self.speed * self.sp.cruise):
+            self._set_target(None)
 
     def _reconsider(self, w, prey) -> None:
         """Switch to a clearly better target.
@@ -1426,7 +1577,7 @@ class Animal:
         mate = self.target
         if mate is not None:
             dx, dy = mate.x - self.x, mate.y - self.y
-            if not mate.alive or not mate.ready_to_mate(w) or dx * dx + dy * dy > (1.25 * self.sp.mate_range) ** 2:
+            if not mate.alive or not mate.ready_to_mate(w) or dx * dx + dy * dy > (1.25 * w.mate_reach(self)) ** 2:
                 mate = None
                 self._set_target(None)
         if mate is None:
@@ -1444,13 +1595,20 @@ class Animal:
         d = math.hypot(mate.x - self.x, mate.y - self.y)
         if d <= MATE_RADIUS:
             male = mate if self.female else self
-            # Female choice: males in good condition, and bigger males, are
-            # more likely to be accepted (sexual selection).
-            appeal = (male.energy / male.max_energy) * (male.mass / male.sp.ref_mass) ** 0.5
-            if w.rng.random() < min(1.0, max(0.2, 0.35 + 0.65 * appeal)):
+            female = self if self.female else mate
+            # Male rivalry: a stronger rival close by may drive this male off.
+            rival = w.strongest_rival(male, female)
+            if rival is not None and not w.mating_contest(male, rival):
+                return
+            # Female choice: males in good shape (well fed, big, healthy, unhurt,
+            # and for vixens a good provider with a rich territory) are accepted
+            # more readily; impaired males are often turned down.
+            if w.rng.random() < w.acceptance(female, male):
                 w.mate(self, mate)
             else:
                 w.rejections[self.si] += 1
+                if male.injury > 0.2 or male.lame:
+                    w.social[self.si]["rejected injured male"] += 1
                 for a, b in ((self, mate), (mate, self)):
                     a.ignore, a.ignore_until = b, w.tick + IGNORE_TICKS
                     a._set_target(None)
